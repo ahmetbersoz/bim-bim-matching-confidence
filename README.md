@@ -17,6 +17,7 @@ Per-element **3D-IoU** and **3D-Compactness** between two IFCs (GT vs PRED) usin
 ## Install
 ```bash
 pip install -r requirements.txt
+```
 
 ## Reference
 This implementation follows the component-level metrics proposed in **Liu et al., 2025**, which accompanies this repo as a reference. 
