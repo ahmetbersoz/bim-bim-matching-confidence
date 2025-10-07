@@ -1,4 +1,4 @@
-# BIM to BIM Matching Evoluation
+# BIM to BIM Matching Evaluation
 
 Per-element **3D-IoU** and **3D-Compactness** between two IFCs (GT vs PRED) using **Open3D** CSG with voxel fallback—while preserving full IFC metadata.
 
