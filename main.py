@@ -152,6 +152,48 @@ def _o3d_signed_volume(mesh: o3d.geometry.TriangleMesh) -> float:
     vol = np.einsum('ij,ij->i', v0, cross).sum() / 6.0
     return float(vol)
 
+def _get_volume(mesh: o3d.geometry.TriangleMesh) -> float:
+    """
+    Robust volume helper: try Open3D's get_volume() first (fast),
+    but catch exceptions (non-watertight meshes) and fall back to:
+      1) a signed-volume triangle-based computation (_o3d_signed_volume),
+      2) convex-hull -> signed-volume,
+      3) finally return 0.0 on failure.
+    Returns a positive float (absolute volume).
+    """
+    # Try to ensure consistent triangle orientation first (best-effort)
+    try:
+        if mesh.is_orientable():
+            mesh.orient_triangles()
+    except Exception:
+        # ignore orientation failures; continue to robust volume paths
+        pass
+
+    # Primary fast attempt: Open3D's get_volume() (may throw for non-watertight meshes)
+    try:
+        vol = mesh.get_volume()
+        return float(abs(vol))
+    except Exception:
+        # Fall back to a pure-Python signed-volume computation over triangles
+        try:
+            vol = _o3d_signed_volume(mesh)
+            return float(abs(vol))
+        except Exception:
+            # As a last resort, try convex hull and compute signed volume on the hull
+            try:
+                hull, _ = mesh.compute_convex_hull()
+                try:
+                    if hull.is_orientable():
+                        hull.orient_triangles()
+                except Exception:
+                    pass
+                # compute signed volume on the hull (avoids relying on get_volume)
+                hvol = _o3d_signed_volume(hull)
+                return float(abs(hvol))
+            except Exception:
+                # give up and return zero
+                return 0.0
+
 def _o3d_mesh_volume_or_hull(mesh: o3d.geometry.TriangleMesh) -> float:
     """Positive volume using mesh if watertight, else convex hull volume."""
     if _o3d_is_watertight(mesh):
@@ -188,14 +230,140 @@ def _o3d_sample_points(meshes: List[o3d.geometry.TriangleMesh], target_pts: int 
     P = np.vstack(points) if points else np.zeros((0, 3))
     return o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P))
 
-def _o3d_boolean_intersection(a: o3d.geometry.TriangleMesh, b: o3d.geometry.TriangleMesh) -> Optional[o3d.geometry.TriangleMesh]:
+
+def legacy_to_tensor_minimal(legacy_mesh: o3d.geometry.TriangleMesh) -> o3d.t.geometry.TriangleMesh:
+    vp = o3d.core.Tensor(np.asarray(legacy_mesh.vertices), o3d.core.Dtype.Float32)
+    ti = o3d.core.Tensor(np.asarray(legacy_mesh.triangles), o3d.core.Dtype.Int64)
+    return o3d.t.geometry.TriangleMesh(vp, ti)
+
+
+def drop_all_but_positions_indices(tm):
+    """
+    Remove all vertex attributes except 'positions' and all triangle attributes
+    except 'indices'. Works across Open3D legacy and tensor-backed TriangleMesh APIs.
+
+    This function is defensive: it tries several common attribute-listing and
+    removal APIs (get_attribute_names, attribute_names, remove_attribute, pop,
+    del) and ignores failures. This avoids calling `tm.vertex.keys()` on a
+    TensorMap (which can raise the 'Key keys not found in TensorMap' error).
+    """
+    def _list_attr_map(attr_map):
+        # Try several ways to list attributes in preferred order.
+        try:
+            if hasattr(attr_map, "get_attribute_names") and callable(attr_map.get_attribute_names):
+                return list(attr_map.get_attribute_names())
+            # attribute_names may be a list/tuple property on some versions
+            if hasattr(attr_map, "attribute_names"):
+                try:
+                    return list(attr_map.attribute_names)
+                except Exception:
+                    pass
+            # Some older APIs expose a mapping-like object (dict-like)
+            if isinstance(attr_map, dict):
+                return list(attr_map.keys())
+            # Avoid blindly calling attr_map.keys() on TensorMap (can be handled as a key),
+            # but if it's callable and behaves like a mapping, attempt it guarded.
+            keys_attr = getattr(attr_map, "keys", None)
+            if callable(keys_attr):
+                try:
+                    return list(keys_attr())
+                except Exception:
+                    pass
+            # Last resort: try to read available attributes via dir (no private names)
+            return [n for n in dir(attr_map) if not n.startswith("_")]
+        except Exception:
+            return []
+
+    def _try_remove_vertex_attr(attr_map, name):
+        # Try removal with several candidate APIs; ignore failures.
+        try:
+            if hasattr(attr_map, "remove_attribute") and callable(attr_map.remove_attribute):
+                attr_map.remove_attribute(name)
+                return True
+        except Exception:
+            pass
+        try:
+            if hasattr(attr_map, "pop") and callable(attr_map.pop):
+                # mapping-like pop
+                attr_map.pop(name, None)
+                return True
+        except Exception:
+            pass
+        try:
+            # mapping delete
+            delattr(attr_map, name)
+            return True
+        except Exception:
+            pass
+        try:
+            # mapping-like __delitem__
+            del attr_map[name]
+            return True
+        except Exception:
+            pass
+        # no supported removal method found / all failed
+        return False
+
+    # Vertex attributes: keep only 'positions'
     try:
-        return a.boolean_intersection(b)
+        vmap = tm.vertex
+        vkeys = _list_attr_map(vmap)
+        for k in vkeys:
+            if k == "positions":
+                continue
+            _ = _try_remove_vertex_attr(vmap, k)
     except Exception:
-        if not _LOG_STATE["boolean_intersection_fallback"]:
-            log_step("  Open3D boolean_intersection failed; will fall back to voxel IoU where needed")
-            _LOG_STATE["boolean_intersection_fallback"] = True
+        # Best-effort: ignore failures
+        pass
+
+    # Triangle attributes: keep only 'indices'
+    try:
+        tmap = tm.triangle
+        tkeys = _list_attr_map(tmap)
+        for k in tkeys:
+            if k == "indices":
+                continue
+            _ = _try_remove_vertex_attr(tmap, k)
+    except Exception:
+        pass
+
+def _o3d_boolean_intersection(a: o3d.geometry.TriangleMesh, b: o3d.geometry.TriangleMesh) -> Optional[o3d.geometry.TriangleMesh]:
+    """
+    Try a.boolean_intersection(b) but first make a cleaned copy of both meshes
+    (remove duplicated/degenerate triangles, non-manifold edges, compute normals).
+    Return None on failure or empty result (caller will fallback to voxels).
+    """
+    # try:
+    a2 = _o3d_mesh_copy(a)
+    b2 = _o3d_mesh_copy(b)
+    # best-effort cleanup before boolean ops
+    for m in (a2, b2):
+        try:
+            m.remove_duplicated_vertices()
+            m.remove_degenerate_triangles()
+            m.remove_duplicated_triangles()
+            m.remove_non_manifold_edges()
+            m.compute_vertex_normals()
+        except Exception:
+            # keep going even if some cleanup calls fail
+            pass
+
+    a2t = legacy_to_tensor_minimal(a2)
+    b2t = legacy_to_tensor_minimal(b2)
+
+    inter_t = a2t.boolean_intersection(b2t)
+    drop_all_but_positions_indices(inter_t)
+    inter = inter_t.to_legacy()
+    
+    # Some Open3D boolean implementations return empty meshes instead of raising.
+    if inter is None or len(inter.vertices) == 0 or len(inter.triangles) == 0:
         return None
+    return inter
+    # except Exception:
+    #     if not _LOG_STATE["boolean_intersection_fallback"]:
+    #         log_step("  Open3D boolean_intersection failed; will fall back to voxel IoU where needed")
+    #         _LOG_STATE["boolean_intersection_fallback"] = True
+    #     return None
 
 def _o3d_boolean_union(meshes: List[o3d.geometry.TriangleMesh]) -> Optional[o3d.geometry.TriangleMesh]:
     if not meshes:
@@ -204,8 +372,17 @@ def _o3d_boolean_union(meshes: List[o3d.geometry.TriangleMesh]) -> Optional[o3d.
         return _o3d_mesh_copy(meshes[0])
     try:
         acc = _o3d_mesh_copy(meshes[0])
+
+        acct = legacy_to_tensor_minimal(acc)
+
         for m in meshes[1:]:
-            acc = acc.boolean_union(m)
+
+            mt = legacy_to_tensor_minimal(m)
+            acct = acct.boolean_union(mt)
+
+            drop_all_but_positions_indices(acct)
+            acc = acct.to_legacy()
+
         return acc
     except Exception:
         if not _LOG_STATE["boolean_union_fallback"]:
@@ -379,6 +556,9 @@ def load_ifc_components(path: str, include_types: Optional[List[str]] = None) ->
     scale = _ifc_length_scale_m(ifc)
     log_step(f"  Unit scale: {scale:.6f} meters per IFC unit")
 
+    # temporarily disable scale
+    scale = 1
+
     settings = _build_geom_settings(use_python_occ=True)
     using_occ = settings is not None
     if not using_occ:
@@ -497,6 +677,52 @@ def rigid_icp_align(pred_meshes: List[o3d.geometry.TriangleMesh], gt_meshes: Lis
     print(reg.transformation)
     return reg.transformation @ T0
 
+
+def rigid_icp_align_xy_only(pred_meshes: List[o3d.geometry.TriangleMesh], gt_meshes: List[o3d.geometry.TriangleMesh]) -> np.ndarray:
+    """
+    Align PRED -> GT using only an X/Y translation. No rotation is applied.
+    Strategy:
+      - Sample point clouds from pred and gt meshes.
+      - Compute mean (centroid) of each point set.
+      - Compute translation vector = (tgt_centroid - src_centroid) but only on X and Y.
+      - Return 4x4 transform with identity rotation and translation [dx, dy, 0].
+    If sampling fails (empty clouds), fall back to the bbox-centroid alignment but zero the Z translation.
+    """
+    # Sample point clouds
+    src = _o3d_pcd_from_meshes(pred_meshes)
+    tgt = _o3d_pcd_from_meshes(gt_meshes)
+
+    # If either cloud is empty, fallback to centroid align but enforce no Z translation
+    try:
+        src_pts = np.asarray(src.points)
+        tgt_pts = np.asarray(tgt.points)
+    except Exception:
+        src_pts = np.zeros((0, 3))
+        tgt_pts = np.zeros((0, 3))
+
+    if src_pts.size == 0 or tgt_pts.size == 0:
+        T_cent = _centroid_align(pred_meshes, gt_meshes)
+        T_cent[2, 3] = 0.0  # enforce no Z translation
+        print("Alignment (fallback centroid, Z zeroed):")
+        print(T_cent)
+        return T_cent
+
+    # Compute centroids
+    src_c = src_pts.mean(axis=0)
+    tgt_c = tgt_pts.mean(axis=0)
+
+    # Build translation only in X and Y; keep Z unchanged
+    dx = float(tgt_c[0] - src_c[0])
+    dy = float(tgt_c[1] - src_c[1])
+    T = np.eye(4, dtype=float)
+    T[0, 3] = dx
+    T[1, 3] = dy
+    T[2, 3] = 0.0
+
+    print("Alignment (XY-translation only):")
+    print(T)
+    return T
+
 # ---------- IoU + Compactness ----------
 
 def _aabb_overlap(a_min, a_max, b_min, b_max) -> bool:
@@ -512,6 +738,92 @@ def _boolean_intersection_volume(a: o3d.geometry.TriangleMesh, b: o3d.geometry.T
 def _voxelize_to_grid(mesh: o3d.geometry.TriangleMesh, pitch: float, origin: np.ndarray, dims: np.ndarray) -> np.ndarray:
     return _o3d_voxelize_indices(mesh, pitch, origin, dims)
 
+
+def visualize_voxel_occupancy(occ_a: np.ndarray, occ_b: np.ndarray, origin: np.ndarray, pitch: float, pts_mode: bool = True) -> None:
+    """
+    Visualize two boolean occupancy grids (occ_a, occ_b) in the same coordinate frame.
+    occ_* : 3D boolean numpy arrays with shape (Nx, Ny, Nz)
+    origin : 3-element array (min corner) for voxel index (0,0,0)
+    pitch  : voxel size (float)
+    pts_mode : True => draw voxel centers as colored points (fast). False => builds boxes (heavy).
+    """
+    if occ_a.shape != occ_b.shape:
+        raise ValueError("occ_a and occ_b must have same shape")
+    # voxel indices where occupied
+    ia = np.argwhere(occ_a)
+    ib = np.argwhere(occ_b)
+
+    if ia.size == 0 and ib.size == 0:
+        log_step("visualize_voxel_occupancy: no occupied voxels")
+        return
+
+    # compute centers
+    centers_a = origin + (ia + 0.5) * pitch if ia.size else np.zeros((0, 3))
+    centers_b = origin + (ib + 0.5) * pitch if ib.size else np.zeros((0, 3))
+
+    # If a voxel is occupied in both, mark as overlap (blue)
+    # Build a merged list with colors: A-only red, B-only green, overlap blue
+    # Use sets of tuple indices for quick overlap test
+    set_a = {tuple(x) for x in ia.tolist()}
+    set_b = {tuple(x) for x in ib.tolist()}
+    overlap_idx = np.array(sorted([x for x in set_a & set_b]))
+    only_a_idx = np.array(sorted([x for x in set_a - set_b]))
+    only_b_idx = np.array(sorted([x for x in set_b - set_a]))
+
+    pts = []
+    cols = []
+    def append_from_indices(arr, color):
+        if arr.size == 0:
+            return
+        arr = np.asarray(arr, dtype=float)
+        centers = origin + (arr + 0.5) * pitch
+        pts.append(centers)
+        cols.append(np.tile(color, (centers.shape[0], 1)))
+
+    append_from_indices(only_a_idx, [1.0, 0.0, 0.0])   # red
+    append_from_indices(only_b_idx, [0.0, 1.0, 0.0])   # green
+    append_from_indices(overlap_idx, [0.0, 0.0, 1.0])  # blue
+
+    if not pts:
+        log_step("visualize_voxel_occupancy: nothing to draw after classification")
+        return
+
+    P = np.vstack(pts)
+    C = np.vstack(cols)
+
+    if pts_mode:
+        pc = o3d.geometry.PointCloud()
+        pc.points = o3d.utility.Vector3dVector(P)
+        pc.colors = o3d.utility.Vector3dVector(C)
+        try:
+            o3d.visualization.draw_geometries([pc], window_name="Voxel occupancy (A:red B:green overlap:blue)")
+        except Exception:
+            log_step("Open3D visualization failed (headless?)")
+    else:
+        # boxes mode: heavy - create box meshes per set (colored)
+        def boxes_from_list(idx_arr, color):
+            if idx_arr is None or idx_arr.size == 0:
+                return o3d.geometry.TriangleMesh()
+            boxes = []
+            half = pitch / 2.0
+            for (i, j, k) in np.asarray(idx_arr, dtype=int):
+                center = origin + np.array([i + 0.5, j + 0.5, k + 0.5]) * pitch
+                box = o3d.geometry.TriangleMesh.create_box(width=pitch, height=pitch, depth=pitch)
+                box.translate(center - np.array([half, half, half]), relative=False)
+                boxes.append(box)
+            m = _o3d_concat_meshes(boxes) if boxes else o3d.geometry.TriangleMesh()
+            if len(m.triangles) > 0:
+                m.paint_uniform_color(color)
+            return m
+        mesh_a = boxes_from_list(only_a_idx, [1, 0, 0])
+        mesh_b = boxes_from_list(only_b_idx, [0, 1, 0])
+        mesh_o = boxes_from_list(overlap_idx, [0, 0, 1])
+        try:
+            o3d.visualization.draw_geometries([mesh_a, mesh_b, mesh_o], window_name="Voxel boxes")
+        except Exception:
+            log_step("Open3D visualization failed (headless?)")
+
+
 def _iou_voxel(a: o3d.geometry.TriangleMesh, b: o3d.geometry.TriangleMesh, pitch: float) -> float:
     a_min, a_max = _o3d_bounds(a)
     b_min, b_max = _o3d_bounds(b)
@@ -524,9 +836,50 @@ def _iou_voxel(a: o3d.geometry.TriangleMesh, b: o3d.geometry.TriangleMesh, pitch
         raise MemoryError(f"Voxel grid too large: dims={tuple(int(d) for d in dims)}")
     occ_a = _voxelize_to_grid(a, pitch, mn, dims)
     occ_b = _voxelize_to_grid(b, pitch, mn, dims)
+
+    # visualize_voxel_occupancy(occ_a, occ_b, mn, pitch, pts_mode=True)
+
     inter = np.count_nonzero(occ_a & occ_b)
     union = np.count_nonzero(occ_a | occ_b)
     return float(inter / union) if union > 0 else 0.0
+
+def visualize_meshes_with_volumes(a: o3d.geometry.TriangleMesh, b: o3d.geometry.TriangleMesh, va: float, vb: float, show_hulls: bool = False) -> None:
+    """
+    Visualize two meshes together with simple coloring and print their computed volumes.
+    - a : mesh A (will be painted red)
+    - b : mesh B (will be painted green)
+    - va, vb : their computed volumes (floats) — printed and shown in the window title
+    - show_hulls : if True, also compute and show convex hulls (wireframe)
+    This is a best-effort helper; visualization failures are caught and logged.
+    """
+    try:
+        ma = _o3d_mesh_copy(a)
+        mb = _o3d_mesh_copy(b)
+        ma.paint_uniform_color([1.0, 0.0, 0.0])  # red
+        mb.paint_uniform_color([0.0, 1.0, 0.0])  # green
+
+        geoms = [ma, mb]
+
+        if show_hulls:
+            try:
+                ha, _ = ma.compute_convex_hull()
+                hb, _ = mb.compute_convex_hull()
+                # paint hulls lightly and show wireframe
+                ha.paint_uniform_color([1.0, 0.6, 0.6])
+                hb.paint_uniform_color([0.6, 1.0, 0.6])
+                geoms.extend([ha, hb])
+            except Exception:
+                log_step("  Convex hull computation for visualization failed; continuing without hulls")
+
+        title = f"Mesh A (red) va={va:.6f}  |  Mesh B (green) vb={vb:.6f}"
+        print(title)
+        try:
+            o3d.visualization.draw_geometries(geoms, window_name=title, mesh_show_wireframe=True)
+        except Exception:
+            log_step("Open3D visualization failed (headless or other issue)")
+    except Exception as exc:
+        log_step(f"Visualization helper failed: {exc}")
+
 
 def _iou_exact(a: o3d.geometry.TriangleMesh, b: o3d.geometry.TriangleMesh) -> float:
     a_min, a_max = _o3d_bounds(a)
@@ -535,10 +888,18 @@ def _iou_exact(a: o3d.geometry.TriangleMesh, b: o3d.geometry.TriangleMesh) -> fl
         return 0.0
     va = _o3d_mesh_volume_or_hull(a)
     vb = _o3d_mesh_volume_or_hull(b)
+
     if va <= 0.0 or vb <= 0.0:
         return 0.0
+  
     inter = _boolean_intersection_volume(a, b)
+
     union = va + vb - inter
+
+    # print(f"  Volumes: va={va:.6f} vb={vb:.6f} intersection={inter:.6f}")
+    # print(f"  IoU = {inter:.6f} / {union:.6f} = {float(inter / union) if union > 0 else 0.0:.6f}")
+    # visualize_meshes_with_volumes(a, b, va, vb, show_hulls=True)
+
     return float(inter / union) if union > 0 else 0.0
 
 def _iou(a: o3d.geometry.TriangleMesh, b: o3d.geometry.TriangleMesh, backend: str, pitch: float) -> float:
@@ -762,15 +1123,16 @@ def main():
 
     # Default CLI arguments for convenience (used only when no CLI args are provided)
     DEFAULT_ARGS = [
-        "--gt", ".\\input\\cenz-main-v1.ifc",
-        "--pred", ".\\input\\cenz-main-v2-revit-geo.ifc",
+        "--gt", ".\\input\\WW_revit_model_v6.ifc",
+        "--pred", ".\\input\\WW_pred_v1_manual_aligned.ifc",
         "--align", "icp",
-        "--backend", "voxel",
+        "--backend", "exact",
         "--voxel-size", "0.05",
-        "--epsilon", "0.8",
+        "--epsilon", "0.1",
         "--save-json", "metrics.json",
         "--save-csv-prefix", "out/metrics",
         "--ifc-classes", "IfcWall", "IfcWallStandardCase"
+        # "--ifc-classes", "IfcSpace"
     ]
 
     # If the script was invoked without extra CLI args, use DEFAULT_ARGS.
@@ -794,8 +1156,8 @@ def main():
     log_step(f"  PRED elements loaded: {len(pr)}")
 
     # # --- TESTING: Use only first 5 elements ---
-    # gt = gt[:5]
-    # pr = pr[:5]
+    # gt = gt[:20]
+    # pr = pr[:20]
     # log_step(f"  Using first 5 GT and PRED elements for testing")
 
     # Visualize pre-alignment (Open3D)
@@ -806,7 +1168,7 @@ def main():
     for m in pred_meshes:
         m.paint_uniform_color([1, 0, 0])  # red
     try:
-        o3d.visualization.draw_geometries(gt_meshes + pred_meshes)
+        o3d.visualization.draw_geometries(gt_meshes + pred_meshes, mesh_show_wireframe=True)
     except Exception:
         pass
 
@@ -816,7 +1178,8 @@ def main():
         if args.align == "icp":
             if OPEN3D_OK:
                 log_step("  Running Open3D ICP alignment")
-                T = rigid_icp_align([c.mesh for c in pr], [c.mesh for c in gt])
+                # T = rigid_icp_align([c.mesh for c in pr], [c.mesh for c in gt])
+                T = rigid_icp_align_xy_only([c.mesh for c in pr], [c.mesh for c in gt])
             else:
                 log_step("  Open3D unavailable; using centroid alignment instead")
                 T = _centroid_align([c.mesh for c in pr], [c.mesh for c in gt])
@@ -834,7 +1197,7 @@ def main():
         for m in pred_meshes:
             m.paint_uniform_color([1, 0, 0])
         try:
-            o3d.visualization.draw_geometries(gt_meshes + pred_meshes)
+            o3d.visualization.draw_geometries(gt_meshes + pred_meshes, mesh_show_wireframe=True)
         except Exception:
             pass
     else:
