@@ -265,6 +265,36 @@ def _mesh_floor_area_xy(mesh: o3d.geometry.TriangleMesh) -> float:
     return 0.5 * float(np.sum(area))
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        v = float(value)
+        return v if math.isfinite(v) else float(default)
+    except Exception:
+        return float(default)
+
+
+def _clamp01(value: float) -> float:
+    if value <= 0.0:
+        return 0.0
+    if value >= 1.0:
+        return 1.0
+    return float(value)
+
+
+def _metric_to_rgb(value: Any) -> Tuple[float, float, float]:
+    """
+    Piecewise-linear color mapping:
+      0.0 -> red, 0.5 -> yellow, 1.0 -> green.
+    Values outside [0,1] are clamped.
+    """
+    v = _clamp01(_safe_float(value, default=0.0))
+    if v <= 0.5:
+        t = v / 0.5  # 0..1
+        return 1.0, t, 0.0
+    t = (v - 0.5) / 0.5  # 0..1
+    return 1.0 - t, 1.0, 0.0
+
+
 def _xyz_dimensions(comp: Comp) -> Tuple[float, float, float]:
     """Return axis-aligned (X, Y, Z) dimensions (AABB extents) in the current coordinate system."""
     try:
@@ -302,6 +332,110 @@ def _write_combined_mesh(meshes: List[o3d.geometry.TriangleMesh], path: str) -> 
         o3d.io.write_triangle_mesh(path, combined, write_ascii=True)
     except Exception as exc:
         log_step(f"  Failed to write mesh {path}: {exc}")
+
+
+def _o3d_concat_meshes_with_vertex_colors(
+    verts_list: List[np.ndarray],
+    tris_list: List[np.ndarray],
+    colors_list: List[np.ndarray]
+) -> o3d.geometry.TriangleMesh:
+    if not verts_list or not tris_list:
+        return o3d.geometry.TriangleMesh()
+
+    V = np.vstack(verts_list) if verts_list else np.zeros((0, 3), dtype=float)
+    F = np.vstack(tris_list) if tris_list else np.zeros((0, 3), dtype=np.int32)
+    mesh = o3d.geometry.TriangleMesh(
+        vertices=o3d.utility.Vector3dVector(V),
+        triangles=o3d.utility.Vector3iVector(F.astype(np.int32, copy=False))
+    )
+    if colors_list:
+        C = np.vstack(colors_list)
+        if C.shape[0] == V.shape[0]:
+            mesh.vertex_colors = o3d.utility.Vector3dVector(C.astype(np.float64, copy=False))
+    try:
+        mesh.compute_vertex_normals()
+    except Exception:
+        pass
+    return mesh
+
+
+def _write_triangle_mesh(mesh: o3d.geometry.TriangleMesh, path: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    if mesh is None or len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
+        log_step(f"  Warning: mesh at {path} is empty.")
+    try:
+        o3d.io.write_triangle_mesh(path, mesh, write_ascii=True)
+    except Exception as exc:
+        log_step(f"  Failed to write mesh {path}: {exc}")
+
+
+def _export_metric_meshes_by_class(
+    comps: List[Comp],
+    metric_by_guid: Dict[str, float],
+    output_dir: str
+) -> List[Dict[str, Any]]:
+    """
+    Export one colored mesh per IFC class, with per-element uniform coloring based on a metric value.
+    Elements missing from metric_by_guid are treated as 0.0 (red).
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    comps_by_type: Dict[str, List[Comp]] = {}
+    for comp in comps:
+        comps_by_type.setdefault(comp.etype, []).append(comp)
+
+    exports: List[Dict[str, Any]] = []
+    for etype in sorted(comps_by_type.keys()):
+        verts_list: List[np.ndarray] = []
+        tris_list: List[np.ndarray] = []
+        colors_list: List[np.ndarray] = []
+        v_offset = 0
+
+        for comp in comps_by_type[etype]:
+            mesh = getattr(comp, "mesh", None)
+            if mesh is None or len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
+                continue
+            V = np.asarray(mesh.vertices)
+            F = np.asarray(mesh.triangles)
+            if V.size == 0 or F.size == 0:
+                continue
+
+            metric_value = metric_by_guid.get(comp.guid, 0.0)
+            color = np.asarray(_metric_to_rgb(metric_value), dtype=float).reshape(1, 3)
+
+            verts_list.append(V)
+            tris_list.append(F + v_offset)
+            colors_list.append(np.tile(color, (V.shape[0], 1)))
+            v_offset += V.shape[0]
+
+        combined = _o3d_concat_meshes_with_vertex_colors(verts_list, tris_list, colors_list)
+        if len(combined.vertices) == 0 or len(combined.triangles) == 0:
+            log_step(f"  Warning: no geometry for metric export type {etype}; skipping.")
+            continue
+        filename = f"{_sanitize_for_filename(etype, fallback='IfcType')}.ply"
+        path = os.path.join(output_dir, filename)
+        _write_triangle_mesh(combined, path)
+        exports.append({
+            "ifc_type": etype,
+            "count": int(len(comps_by_type[etype])),
+            "path": path
+        })
+
+    return exports
+
+
+def _metric_map_by_guid(
+    records: List[Dict[str, Any]],
+    guid_key: str,
+    value_key: str
+) -> Dict[str, float]:
+    mapping: Dict[str, float] = {}
+    for row in records or []:
+        guid = row.get(guid_key)
+        if not guid:
+            continue
+        mapping[str(guid)] = _safe_float(row.get(value_key, 0.0), default=0.0)
+    return mapping
 
 
 def _export_space_meshes_for_round(
@@ -2594,6 +2728,48 @@ def main():
         "pred_mesh": pred_mesh_path,
         "pred_mesh_global_round": pred_mesh_global_round_path
     }
+
+    try:
+        metric_mesh_dir = os.path.join(mesh_output_dir_abs, "metrics")
+        local_round = rounds.get("local") or {}
+        per_gt_local = local_round.get("per_gt") or []
+        per_pred_local = local_round.get("per_pred") or []
+
+        iou_gt_map = _metric_map_by_guid(per_gt_local, "gt_guid", "iou_union_pred_vs_gt")
+        iou_pred_map = _metric_map_by_guid(per_pred_local, "pred_guid", "iou_union_gt_vs_pred")
+        comp_gt_map = _metric_map_by_guid(per_gt_local, "gt_guid", "local_compactness_gt_to_pred")
+        comp_pred_map = _metric_map_by_guid(per_pred_local, "pred_guid", "local_compactness_pred_to_gt")
+
+        iou_root = os.path.join(metric_mesh_dir, "3DIou")
+        iou_gt_dir = os.path.join(iou_root, "gt")
+        iou_pred_dir = os.path.join(iou_root, "pred")
+        comp_gt_dir = os.path.join(metric_mesh_dir, "3Dcompactness_gt")
+        comp_pred_dir = os.path.join(metric_mesh_dir, "3Dcompactness_pred")
+
+        log_step(f"Exporting metric meshes to {metric_mesh_dir}")
+        report_mesh_exports["metrics"] = {
+            "directory": metric_mesh_dir,
+            "3DIou": {
+                "gt": {
+                    "directory": iou_gt_dir,
+                    "by_class": _export_metric_meshes_by_class(elems_gt, iou_gt_map, iou_gt_dir)
+                },
+                "pred": {
+                    "directory": iou_pred_dir,
+                    "by_class": _export_metric_meshes_by_class(elems_pr, iou_pred_map, iou_pred_dir)
+                }
+            },
+            "3Dcompactness_gt": {
+                "directory": comp_gt_dir,
+                "by_class": _export_metric_meshes_by_class(elems_gt, comp_gt_map, comp_gt_dir)
+            },
+            "3Dcompactness_pred": {
+                "directory": comp_pred_dir,
+                "by_class": _export_metric_meshes_by_class(elems_pr, comp_pred_map, comp_pred_dir)
+            }
+        }
+    except Exception as exc:
+        log_step(f"Metric mesh export failed: {exc}")
 
     report: Dict[str, Any] = {
         "config": report_config,
