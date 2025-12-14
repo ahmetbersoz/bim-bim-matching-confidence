@@ -265,11 +265,8 @@ def _mesh_floor_area_xy(mesh: o3d.geometry.TriangleMesh) -> float:
     return 0.5 * float(np.sum(area))
 
 
-def _space_xyz_dimensions(comp: Comp) -> Tuple[float, float, float]:
-    """
-    Return axis-aligned (X, Y, Z) dimensions of a space in the current coordinate system.
-    For non-rectangular footprints, this effectively returns the largest X/Y/Z extents.
-    """
+def _xyz_dimensions(comp: Comp) -> Tuple[float, float, float]:
+    """Return axis-aligned (X, Y, Z) dimensions (AABB extents) in the current coordinate system."""
     try:
         mn = np.asarray(getattr(comp, "aabb_min", None), dtype=float)
         mx = np.asarray(getattr(comp, "aabb_max", None), dtype=float)
@@ -285,6 +282,10 @@ def _space_xyz_dimensions(comp: Comp) -> Tuple[float, float, float]:
     mn2, mx2 = _o3d_bounds(mesh)
     ext2 = np.abs(np.asarray(mx2, dtype=float) - np.asarray(mn2, dtype=float))
     return float(ext2[0]), float(ext2[1]), float(ext2[2])
+
+
+def _space_xyz_dimensions(comp: Comp) -> Tuple[float, float, float]:
+    return _xyz_dimensions(comp)
 
 
 def _write_combined_mesh(meshes: List[o3d.geometry.TriangleMesh], path: str) -> None:
@@ -1811,6 +1812,7 @@ def compute_all_metrics(
     gt_ious = []
     log_step("  Computing per-GT aggregates")
     for i, g in enumerate(gt):
+        gt_dim_x, gt_dim_y, gt_dim_z = _xyz_dimensions(g)
         js = [j for j in range(n) if M[i, j] > 0.0]
         local_compact = (1.0 / len(js)) if js else 0.0
         gt_local_compact.append(local_compact)
@@ -1834,6 +1836,9 @@ def compute_all_metrics(
             "gt_index": i,
             "gt_guid": g.guid,
             "gt_ifc_type": g.etype,
+            "gt_dim_x": gt_dim_x,
+            "gt_dim_y": gt_dim_y,
+            "gt_dim_z": gt_dim_z,
             "gt_meta": asdict(g.meta),
             "gt_wall_thickness": float(g.wall_thickness) if g.wall_thickness is not None else None,
             "avg_matched_pred_wall_thickness": avg_match_pred_wall,
@@ -1851,6 +1856,7 @@ def compute_all_metrics(
     pr_ious = []
     log_step("  Computing per-PRED aggregates")
     for j, p in enumerate(pr):
+        pred_dim_x, pred_dim_y, pred_dim_z = _xyz_dimensions(p)
         is_ = [i for i in range(m) if M[i, j] > 0.0]
         local_compact = (1.0 / len(is_)) if is_ else 0.0
         pr_local_compact.append(local_compact)
@@ -1868,6 +1874,9 @@ def compute_all_metrics(
             "pred_index": j,
             "pred_guid": p.guid,
             "pred_ifc_type": p.etype,
+            "pred_dim_x": pred_dim_x,
+            "pred_dim_y": pred_dim_y,
+            "pred_dim_z": pred_dim_z,
             "pred_meta": asdict(p.meta),
             "pred_wall_thickness": float(p.wall_thickness) if p.wall_thickness is not None else None,
             "matches_gt_indices": is_,
@@ -1922,11 +1931,15 @@ def _write_csv_bundle(prefix: str, per_gt: List[Dict[str, Any]], per_pred: List[
         w = csv.writer(f)
         w.writerow([
             "gt_index","gt_guid","gt_ifc_type","iou_union_pred_vs_gt",
-            "local_compactness_gt_to_pred","gt_wall_thickness","avg_matched_pred_wall_thickness","num_matches","match_pred_guids"
+            "local_compactness_gt_to_pred","gt_wall_thickness","avg_matched_pred_wall_thickness","num_matches","match_pred_guids",
+            "gt_dim_x","gt_dim_y","gt_dim_z"
         ])
         for r in per_gt:
             thickness = r.get("gt_wall_thickness")
             matched_avg = r.get("avg_matched_pred_wall_thickness")
+            dim_x = r.get("gt_dim_x")
+            dim_y = r.get("gt_dim_y")
+            dim_z = r.get("gt_dim_z")
             w.writerow([
                 r.get("gt_index"),
                 r.get("gt_guid"),
@@ -1936,17 +1949,24 @@ def _write_csv_bundle(prefix: str, per_gt: List[Dict[str, Any]], per_pred: List[
                 "" if thickness in (None, "") else f'{float(thickness):.6f}',
                 "" if matched_avg in (None, "") else f'{float(matched_avg):.6f}',
                 len(r.get("matches_pred_indices", [])),
-                ";".join(r.get("matches_pred_guids", []))
+                ";".join(r.get("matches_pred_guids", [])),
+                "" if dim_x in (None, "") else f'{float(dim_x):.6f}',
+                "" if dim_y in (None, "") else f'{float(dim_y):.6f}',
+                "" if dim_z in (None, "") else f'{float(dim_z):.6f}'
             ])
 
     with open(f"{prefix}_per_pred.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow([
             "pred_index","pred_guid","pred_ifc_type","iou_union_gt_vs_pred",
-            "local_compactness_pred_to_gt","pred_wall_thickness","num_matches","match_gt_guids"
+            "local_compactness_pred_to_gt","pred_wall_thickness","num_matches","match_gt_guids",
+            "pred_dim_x","pred_dim_y","pred_dim_z"
         ])
         for r in per_pred:
             thickness = r.get("pred_wall_thickness")
+            dim_x = r.get("pred_dim_x")
+            dim_y = r.get("pred_dim_y")
+            dim_z = r.get("pred_dim_z")
             w.writerow([
                 r.get("pred_index"),
                 r.get("pred_guid"),
@@ -1955,7 +1975,10 @@ def _write_csv_bundle(prefix: str, per_gt: List[Dict[str, Any]], per_pred: List[
                 f'{float(r.get("local_compactness_pred_to_gt", 0.0)):.6f}',
                 "" if thickness in (None, "") else f'{float(thickness):.6f}',
                 len(r.get("matches_gt_indices", [])),
-                ";".join(r.get("matches_gt_guids", []))
+                ";".join(r.get("matches_gt_guids", [])),
+                "" if dim_x in (None, "") else f'{float(dim_x):.6f}',
+                "" if dim_y in (None, "") else f'{float(dim_y):.6f}',
+                "" if dim_z in (None, "") else f'{float(dim_z):.6f}'
             ])
 
     with open(f"{prefix}_edges.csv", "w", newline="", encoding="utf-8") as f:
@@ -2260,7 +2283,7 @@ def main():
         "--epsilon", "0.10",
         "--save-json", "metrics_obb.json",
         "--save-csv-prefix", "out/metrics_obb",
-        "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace",
+        "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace", "IfcDoor", "IfcWindow", "IfcOpening",
         "--include-unmatched", "ignore",
     ]
 
