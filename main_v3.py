@@ -2732,7 +2732,7 @@ def main():
         metric_mesh_root_dir = os.path.join(mesh_output_dir_abs, "metrics")
         os.makedirs(metric_mesh_root_dir, exist_ok=True)
 
-        def _export_metric_meshes_for_round(round_label: str, pred_elems: List[Comp]) -> Dict[str, Any]:
+        def _export_metric_meshes_for_round(round_label: str, pred_elems: List[Comp], pred_spaces: List[Comp]) -> Dict[str, Any]:
             round_data = rounds.get(round_label) or {}
             per_gt = round_data.get("per_gt") or []
             per_pred = round_data.get("per_pred") or []
@@ -2741,6 +2741,27 @@ def main():
             iou_pred_map = _metric_map_by_guid(per_pred, "pred_guid", "iou_union_gt_vs_pred")
             comp_gt_map = _metric_map_by_guid(per_gt, "gt_guid", "local_compactness_gt_to_pred")
             comp_pred_map = _metric_map_by_guid(per_pred, "pred_guid", "local_compactness_pred_to_gt")
+
+            space_matches = round_data.get("space_matches") or []
+            space_iou_gt_map: Dict[str, float] = {}
+            space_iou_pred_map: Dict[str, float] = {}
+            space_compact_gt_map: Dict[str, float] = {}
+            space_compact_pred_map: Dict[str, float] = {}
+            for rec in space_matches:
+                gt_guid = rec.get("gt_guid")
+                pred_guid = rec.get("pred_guid")
+                iou_value = _safe_float(rec.get("space_iou", 0.0), default=0.0)
+                if gt_guid:
+                    space_iou_gt_map[str(gt_guid)] = iou_value
+                    space_compact_gt_map[str(gt_guid)] = 1.0
+                if pred_guid:
+                    space_iou_pred_map[str(pred_guid)] = iou_value
+                    space_compact_pred_map[str(pred_guid)] = 1.0
+
+            iou_gt_map.update(space_iou_gt_map)
+            iou_pred_map.update(space_iou_pred_map)
+            comp_gt_map.update(space_compact_gt_map)
+            comp_pred_map.update(space_compact_pred_map)
 
             round_mesh_dir = os.path.join(metric_mesh_root_dir, f"{round_label}_round")
             iou_root = os.path.join(round_mesh_dir, "3DIou")
@@ -2755,31 +2776,33 @@ def main():
                 "3DIou": {
                     "gt": {
                         "directory": iou_gt_dir,
-                        "by_class": _export_metric_meshes_by_class(elems_gt, iou_gt_map, iou_gt_dir)
+                        "by_class": _export_metric_meshes_by_class(elems_gt + spaces_gt, iou_gt_map, iou_gt_dir)
                     },
                     "pred": {
                         "directory": iou_pred_dir,
-                        "by_class": _export_metric_meshes_by_class(pred_elems, iou_pred_map, iou_pred_dir)
+                        "by_class": _export_metric_meshes_by_class(pred_elems + pred_spaces, iou_pred_map, iou_pred_dir)
                     }
                 },
                 "3Dcompactness_gt": {
                     "directory": comp_gt_dir,
-                    "by_class": _export_metric_meshes_by_class(elems_gt, comp_gt_map, comp_gt_dir)
+                    "by_class": _export_metric_meshes_by_class(elems_gt + spaces_gt, comp_gt_map, comp_gt_dir)
                 },
                 "3Dcompactness_pred": {
                     "directory": comp_pred_dir,
-                    "by_class": _export_metric_meshes_by_class(pred_elems, comp_pred_map, comp_pred_dir)
+                    "by_class": _export_metric_meshes_by_class(pred_elems + pred_spaces, comp_pred_map, comp_pred_dir)
                 }
             }
 
         report_mesh_exports["metrics"] = {"directory": metric_mesh_root_dir, "rounds": {}}
         report_mesh_exports["metrics"]["rounds"]["global"] = _export_metric_meshes_for_round(
             "global",
-            elems_pr_global_aligned
+            elems_pr_global_aligned,
+            spaces_pr_global_aligned
         )
         report_mesh_exports["metrics"]["rounds"]["local"] = _export_metric_meshes_for_round(
             "local",
-            elems_pr
+            elems_pr,
+            spaces_pr
         )
     except Exception as exc:
         log_step(f"Metric mesh export failed: {exc}")
