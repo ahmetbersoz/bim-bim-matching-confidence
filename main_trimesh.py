@@ -231,156 +231,177 @@ def _o3d_sample_points(meshes: List[o3d.geometry.TriangleMesh], target_pts: int 
     return o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P))
 
 
-def legacy_to_tensor_minimal(legacy_mesh: o3d.geometry.TriangleMesh) -> o3d.t.geometry.TriangleMesh:
-    vp = o3d.core.Tensor(np.asarray(legacy_mesh.vertices), o3d.core.Dtype.Float32)
-    ti = o3d.core.Tensor(np.asarray(legacy_mesh.triangles), o3d.core.Dtype.Int64)
-    return o3d.t.geometry.TriangleMesh(vp, ti)
-
-
-def drop_all_but_positions_indices(tm):
-    """
-    Remove all vertex attributes except 'positions' and all triangle attributes
-    except 'indices'. Works across Open3D legacy and tensor-backed TriangleMesh APIs.
-
-    This function is defensive: it tries several common attribute-listing and
-    removal APIs (get_attribute_names, attribute_names, remove_attribute, pop,
-    del) and ignores failures. This avoids calling `tm.vertex.keys()` on a
-    TensorMap (which can raise the 'Key keys not found in TensorMap' error).
-    """
-    def _list_attr_map(attr_map):
-        # Try several ways to list attributes in preferred order.
-        try:
-            if hasattr(attr_map, "get_attribute_names") and callable(attr_map.get_attribute_names):
-                return list(attr_map.get_attribute_names())
-            # attribute_names may be a list/tuple property on some versions
-            if hasattr(attr_map, "attribute_names"):
-                try:
-                    return list(attr_map.attribute_names)
-                except Exception:
-                    pass
-            # Some older APIs expose a mapping-like object (dict-like)
-            if isinstance(attr_map, dict):
-                return list(attr_map.keys())
-            # Avoid blindly calling attr_map.keys() on TensorMap (can be handled as a key),
-            # but if it's callable and behaves like a mapping, attempt it guarded.
-            keys_attr = getattr(attr_map, "keys", None)
-            if callable(keys_attr):
-                try:
-                    return list(keys_attr())
-                except Exception:
-                    pass
-            # Last resort: try to read available attributes via dir (no private names)
-            return [n for n in dir(attr_map) if not n.startswith("_")]
-        except Exception:
-            return []
-
-    def _try_remove_vertex_attr(attr_map, name):
-        # Try removal with several candidate APIs; ignore failures.
-        try:
-            if hasattr(attr_map, "remove_attribute") and callable(attr_map.remove_attribute):
-                attr_map.remove_attribute(name)
-                return True
-        except Exception:
-            pass
-        try:
-            if hasattr(attr_map, "pop") and callable(attr_map.pop):
-                # mapping-like pop
-                attr_map.pop(name, None)
-                return True
-        except Exception:
-            pass
-        try:
-            # mapping delete
-            delattr(attr_map, name)
-            return True
-        except Exception:
-            pass
-        try:
-            # mapping-like __delitem__
-            del attr_map[name]
-            return True
-        except Exception:
-            pass
-        # no supported removal method found / all failed
-        return False
-
-    # Vertex attributes: keep only 'positions'
+def _o3d_to_trimesh(mesh: o3d.geometry.TriangleMesh) -> Optional['trimesh.Trimesh']:
+    """Convert an Open3D triangle mesh into a trimesh.Trimesh."""
+    if not TRIMESH_OK:
+        return None
+    if mesh is None or len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
+        return None
     try:
-        vmap = tm.vertex
-        vkeys = _list_attr_map(vmap)
-        for k in vkeys:
-            if k == "positions":
-                continue
-            _ = _try_remove_vertex_attr(vmap, k)
+        vertices = np.asarray(mesh.vertices, dtype=np.float64)
+        faces = np.asarray(mesh.triangles, dtype=np.int64)
+        if vertices.size == 0 or faces.size == 0:
+            return None
+        tm = trimesh.Trimesh(vertices=vertices, faces=faces, process=False, maintain_order=True)
+        try:
+            tm.remove_duplicate_faces()
+            tm.remove_degenerate_faces()
+            tm.remove_unreferenced_vertices()
+            tm.remove_infinite_values()
+            tm.remove_nan()
+        except Exception:
+            pass
+        return tm
     except Exception:
-        # Best-effort: ignore failures
-        pass
+        return None
 
-    # Triangle attributes: keep only 'indices'
+
+def _trimesh_to_o3d(mesh: 'trimesh.Trimesh') -> Optional[o3d.geometry.TriangleMesh]:
+    """Convert a trimesh.Trimesh back into an Open3D TriangleMesh."""
+    if mesh is None:
+        return None
     try:
-        tmap = tm.triangle
-        tkeys = _list_attr_map(tmap)
-        for k in tkeys:
-            if k == "indices":
-                continue
-            _ = _try_remove_vertex_attr(tmap, k)
+        vertices = np.asarray(mesh.vertices, dtype=np.float64)
+        faces = np.asarray(mesh.faces, dtype=np.int64)
+        if vertices.size == 0 or faces.size == 0:
+            return None
+        out = o3d.geometry.TriangleMesh(
+            vertices=o3d.utility.Vector3dVector(vertices),
+            triangles=o3d.utility.Vector3iVector(faces.astype(np.int32))
+        )
+        try:
+            out.compute_vertex_normals()
+        except Exception:
+            pass
+        return out
     except Exception:
-        pass
+        return None
+
+
+def _collapse_trimesh_result(result: Any) -> Optional['trimesh.Trimesh']:
+    """Normalize trimesh boolean outputs into a single Trimesh instance."""
+    if not TRIMESH_OK:
+        return None
+    if result is None:
+        return None
+    if isinstance(result, trimesh.Trimesh):
+        return result
+    if isinstance(result, (list, tuple)):
+        meshes = [m for m in result if isinstance(m, trimesh.Trimesh) and len(getattr(m, 'faces', [])) > 0]
+        if not meshes:
+            return None
+        if len(meshes) == 1:
+            return meshes[0]
+        try:
+            return trimesh.util.concatenate(meshes)
+        except Exception:
+            return meshes[0]
+    if isinstance(result, trimesh.Scene):
+        try:
+            collapsed = result.dump(concatenate=True)
+            if isinstance(collapsed, trimesh.Trimesh):
+                return collapsed
+            return _collapse_trimesh_result(collapsed)
+        except Exception:
+            try:
+                meshes = [g for g in result.geometry.values() if isinstance(g, trimesh.Trimesh)]
+                if not meshes:
+                    return None
+                if len(meshes) == 1:
+                    return meshes[0]
+                return trimesh.util.concatenate(meshes)
+            except Exception:
+                return None
+    return None
+
 
 def _o3d_boolean_intersection(a: o3d.geometry.TriangleMesh, b: o3d.geometry.TriangleMesh) -> Optional[o3d.geometry.TriangleMesh]:
-    """
-    Try a.boolean_intersection(b) but first make a cleaned copy of both meshes
-    (remove duplicated/degenerate triangles, non-manifold edges, compute normals).
-    Return None on failure or empty result (caller will fallback to voxels).
-    """
-    # try:
+    """Compute the boolean intersection using trimesh as the backend."""
+    if not TRIMESH_OK:
+        if not _LOG_STATE['boolean_intersection_fallback']:
+            log_step('  Trimesh not available; falling back to voxel IoU where needed')
+            _LOG_STATE['boolean_intersection_fallback'] = True
+        return None
+
     a2 = _o3d_mesh_copy(a)
     b2 = _o3d_mesh_copy(b)
-    # best-effort cleanup before boolean ops
     for m in (a2, b2):
-        try:
-            m.remove_duplicated_vertices()
-            m.remove_degenerate_triangles()
-            m.remove_duplicated_triangles()
-            m.remove_non_manifold_edges()
-            m.compute_vertex_normals()
-        except Exception:
-            # keep going even if some cleanup calls fail
-            pass
+        _o3d_clean_mesh(m)
 
-    a2t = legacy_to_tensor_minimal(a2)
-    b2t = legacy_to_tensor_minimal(b2)
-
-    inter_t = a2t.boolean_intersection(b2t)
-    drop_all_but_positions_indices(inter_t)
-    inter = inter_t.to_legacy()
-    
-    # Some Open3D boolean implementations return empty meshes instead of raising.
-    if inter is None or len(inter.vertices) == 0 or len(inter.triangles) == 0:
+    tm_a = _o3d_to_trimesh(a2)
+    tm_b = _o3d_to_trimesh(b2)
+    if tm_a is None or tm_b is None:
+        if not _LOG_STATE['boolean_intersection_fallback']:
+            log_step('  Failed to convert meshes for intersection; will use voxel IoU')
+            _LOG_STATE['boolean_intersection_fallback'] = True
         return None
-    return inter
-    # except Exception:
-    #     if not _LOG_STATE["boolean_intersection_fallback"]:
-    #         log_step("  Open3D boolean_intersection failed; will fall back to voxel IoU where needed")
-    #         _LOG_STATE["boolean_intersection_fallback"] = True
-    #     return None
+
+    try:
+        inter_raw = trimesh.boolean.intersection([tm_a, tm_b], engine=None)
+        inter_tm = _collapse_trimesh_result(inter_raw)
+    except Exception:
+        inter_tm = None
+
+    faces = getattr(inter_tm, 'faces', np.zeros((0, 3))) if inter_tm is not None else np.zeros((0, 3))
+    if inter_tm is None or faces.size == 0:
+        if not _LOG_STATE['boolean_intersection_fallback']:
+            log_step('  Trimesh boolean_intersection failed; will fall back to voxel IoU where needed')
+            _LOG_STATE['boolean_intersection_fallback'] = True
+        return None
+
+    inter_o3d = _trimesh_to_o3d(inter_tm)
+    if inter_o3d is None or len(inter_o3d.triangles) == 0:
+        if not _LOG_STATE['boolean_intersection_fallback']:
+            log_step('  Intersection result empty after conversion; falling back to voxel IoU')
+            _LOG_STATE['boolean_intersection_fallback'] = True
+        return None
+    return inter_o3d
+
 
 def _o3d_boolean_union(meshes: List[o3d.geometry.TriangleMesh]) -> Optional[o3d.geometry.TriangleMesh]:
+    """Compute the boolean union of meshes using trimesh."""
     if not meshes:
         return None
-    try:
-        acc = legacy_to_tensor_minimal(_o3d_mesh_copy(meshes[0]))
-        for m in meshes[1:]:
-            mt = legacy_to_tensor_minimal(_o3d_mesh_copy(m))
-            acc = acc.boolean_union(mt)
-        drop_all_but_positions_indices(acc)
-        out = acc.to_legacy()
-        return out if out is not None and len(out.triangles) > 0 else None
-    except Exception:
-        if not _LOG_STATE["boolean_union_fallback"]:
-            log_step("  Open3D boolean_union failed; will fall back to voxel-based union approximation")
-            _LOG_STATE["boolean_union_fallback"] = True
+
+    if not TRIMESH_OK:
+        if not _LOG_STATE['boolean_union_fallback']:
+            log_step('  Trimesh not available; will fall back to voxel-based union approximation')
+            _LOG_STATE['boolean_union_fallback'] = True
         return None
+
+    converted: List['trimesh.Trimesh'] = []
+    for mesh in meshes:
+        if mesh is None or len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
+            continue
+        mc = _o3d_mesh_copy(mesh)
+        _o3d_clean_mesh(mc)
+        tm = _o3d_to_trimesh(mc)
+        faces = getattr(tm, 'faces', np.zeros((0, 3))) if tm is not None else np.zeros((0, 3))
+        if tm is not None and faces.size > 0:
+            converted.append(tm)
+    if not converted:
+        return None
+
+    try:
+        union_raw = trimesh.boolean.union(converted, engine=None)
+        union_tm = _collapse_trimesh_result(union_raw)
+    except Exception:
+        union_tm = None
+
+    faces = getattr(union_tm, 'faces', np.zeros((0, 3))) if union_tm is not None else np.zeros((0, 3))
+    if union_tm is None or faces.size == 0:
+        if not _LOG_STATE['boolean_union_fallback']:
+            log_step('  Trimesh boolean_union failed; will fall back to voxel-based union approximation')
+            _LOG_STATE['boolean_union_fallback'] = True
+        return None
+
+    union_o3d = _trimesh_to_o3d(union_tm)
+    if union_o3d is None or len(union_o3d.triangles) == 0:
+        if not _LOG_STATE['boolean_union_fallback']:
+            log_step('  Union result empty after conversion; falling back to voxel approximation')
+            _LOG_STATE['boolean_union_fallback'] = True
+        return None
+    return union_o3d
 
 def _o3d_voxelize_indices(mesh: o3d.geometry.TriangleMesh, pitch: float, origin: np.ndarray, dims: np.ndarray) -> np.ndarray:
     """Voxelize mesh into a fixed grid defined by (origin, pitch, dims)."""
