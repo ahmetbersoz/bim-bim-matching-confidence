@@ -265,6 +265,28 @@ def _mesh_floor_area_xy(mesh: o3d.geometry.TriangleMesh) -> float:
     return 0.5 * float(np.sum(area))
 
 
+def _space_xyz_dimensions(comp: Comp) -> Tuple[float, float, float]:
+    """
+    Return axis-aligned (X, Y, Z) dimensions of a space in the current coordinate system.
+    For non-rectangular footprints, this effectively returns the largest X/Y/Z extents.
+    """
+    try:
+        mn = np.asarray(getattr(comp, "aabb_min", None), dtype=float)
+        mx = np.asarray(getattr(comp, "aabb_max", None), dtype=float)
+        if mn.shape == (3,) and mx.shape == (3,) and np.all(np.isfinite(mn)) and np.all(np.isfinite(mx)):
+            ext = np.abs(mx - mn)
+            return float(ext[0]), float(ext[1]), float(ext[2])
+    except Exception:
+        pass
+
+    mesh = getattr(comp, "mesh", None)
+    if mesh is None or len(mesh.vertices) == 0:
+        return 0.0, 0.0, 0.0
+    mn2, mx2 = _o3d_bounds(mesh)
+    ext2 = np.abs(np.asarray(mx2, dtype=float) - np.asarray(mn2, dtype=float))
+    return float(ext2[0]), float(ext2[1]), float(ext2[2])
+
+
 def _write_combined_mesh(meshes: List[o3d.geometry.TriangleMesh], path: str) -> None:
     """Export a combined mesh built from the provided list to a file path."""
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -1441,6 +1463,8 @@ def _run_round(
         post_iou = iou_between_two_obbs(gt_space.obb, spaces_pr[j_pr].obb, eps=inside_eps)
         gt_floor_area = _mesh_floor_area_xy(gt_space.mesh)
         pred_floor_area = _mesh_floor_area_xy(spaces_pr[j_pr].mesh)
+        gt_dim_x, gt_dim_y, gt_dim_z = _space_xyz_dimensions(gt_space)
+        pred_dim_x, pred_dim_y, pred_dim_z = _space_xyz_dimensions(spaces_pr[j_pr])
 
         floor_area_records.append({
             "gt_guid": gt_guid,
@@ -1452,6 +1476,12 @@ def _run_round(
             "pred_floor_area": pred_floor_area,
             "floor_area_diff": pred_floor_area - gt_floor_area,
             "floor_area_abs_diff": abs(pred_floor_area - gt_floor_area),
+            "gt_dim_x": gt_dim_x,
+            "gt_dim_y": gt_dim_y,
+            "gt_dim_z": gt_dim_z,
+            "pred_dim_x": pred_dim_x,
+            "pred_dim_y": pred_dim_y,
+            "pred_dim_z": pred_dim_z,
             "is_target": is_target_space
         })
 
@@ -1998,6 +2028,8 @@ def write_floor_area_csv(path: str, round_label: str, records: List[Dict[str, An
             "space_iou",
             "gt_floor_area", "pred_floor_area",
             "floor_area_diff", "floor_area_abs_diff",
+            "gt_dim_x", "gt_dim_y", "gt_dim_z",
+            "pred_dim_x", "pred_dim_y", "pred_dim_z",
             "is_target"
         ])
         for rec in records:
@@ -2012,6 +2044,12 @@ def write_floor_area_csv(path: str, round_label: str, records: List[Dict[str, An
                 f'{float(rec.get("pred_floor_area", 0.0)):.6f}',
                 f'{float(rec.get("floor_area_diff", 0.0)):.6f}',
                 f'{float(rec.get("floor_area_abs_diff", 0.0)):.6f}',
+                f'{float(rec.get("gt_dim_x", 0.0)):.6f}',
+                f'{float(rec.get("gt_dim_y", 0.0)):.6f}',
+                f'{float(rec.get("gt_dim_z", 0.0)):.6f}',
+                f'{float(rec.get("pred_dim_x", 0.0)):.6f}',
+                f'{float(rec.get("pred_dim_y", 0.0)):.6f}',
+                f'{float(rec.get("pred_dim_z", 0.0)):.6f}',
                 int(bool(rec.get("is_target")))
             ])
     if records:
@@ -2190,30 +2228,12 @@ def main():
     ap.add_argument("--inside-eps", type=float, default=1e-7, help="Tolerance for half-space tests / plane membership.")
     ap.add_argument("--ie-cap", type=int, default=8, help="Max K for exact inclusion-exclusion before pairwise approximation.")
 
-    # Default CLI arguments for convenience (used only when no CLI args are provided)
-    DEFAULT_ARGS = [
-        "--gt", ".\\input\\JohnMuir_revit_rotated_spaces_1st.ifc",
-        "--pred", ".\\input\\john-muir-1st-v1-ifc4-geo-rotated.ifc",
-        # "--target-space-guid", "1663O7_YHCi8qg8Qi5si4a",
-        # "--target-space-guid", "1663O7_YHCi8qg8Qi5si4R",
-        "--mesh-output-dir", "out",
-        "--floor-area-csv", "out/matched_space_floor_areas.csv",
-        "--align", "centroid",
-        "--space-align", "icp",
-        "--space-match-thresh", "0.25",
-        "--epsilon", "0.10",
-        "--save-json", "metrics_obb.json",
-        "--save-csv-prefix", "out/metrics_obb",
-        "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace",
-        "--include-unmatched", "ignore",
-    ]
-
     # # Default CLI arguments for convenience (used only when no CLI args are provided)
     # DEFAULT_ARGS = [
-    #     "--gt", ".\\input\\WW_revit_model_v6_w_spaces.ifc",
-    #     "--pred", ".\\input\\ww-v3-ifc4-geo.ifc",
-    #     "--target-space-guid", "1UABPD7uD69BRTD38UZ2$I",
-    #     # "--target-space-guid", "1UABPD7uD69BRTD38UZ2$e",
+    #     "--gt", ".\\input\\JohnMuir_revit_rotated_spaces_1st.ifc",
+    #     "--pred", ".\\input\\john-muir-1st-v1-ifc4-geo-rotated.ifc",
+    #     # "--target-space-guid", "1663O7_YHCi8qg8Qi5si4a",
+    #     # "--target-space-guid", "1663O7_YHCi8qg8Qi5si4R",
     #     "--mesh-output-dir", "out",
     #     "--floor-area-csv", "out/matched_space_floor_areas.csv",
     #     "--align", "centroid",
@@ -2225,6 +2245,24 @@ def main():
     #     "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace",
     #     "--include-unmatched", "ignore",
     # ]
+
+    # Default CLI arguments for convenience (used only when no CLI args are provided)
+    DEFAULT_ARGS = [
+        "--gt", ".\\input\\WW_revit_model_v6_w_spaces.ifc",
+        "--pred", ".\\input\\ww-v3-ifc4-geo.ifc",
+        "--target-space-guid", "1UABPD7uD69BRTD38UZ2$I",
+        # "--target-space-guid", "1UABPD7uD69BRTD38UZ2$e",
+        "--mesh-output-dir", "out",
+        "--floor-area-csv", "out/matched_space_floor_areas.csv",
+        "--align", "centroid",
+        "--space-align", "icp",
+        "--space-match-thresh", "0.25",
+        "--epsilon", "0.10",
+        "--save-json", "metrics_obb.json",
+        "--save-csv-prefix", "out/metrics_obb",
+        "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace",
+        "--include-unmatched", "ignore",
+    ]
 
 
     if len(sys.argv) == 1:
