@@ -369,6 +369,21 @@ def _write_triangle_mesh(mesh: o3d.geometry.TriangleMesh, path: str) -> None:
         log_step(f"  Failed to write mesh {path}: {exc}")
 
 
+def _write_empty_ply(path: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write("comment Empty mesh\n")
+        f.write("element vertex 0\n")
+        f.write("property double x\n")
+        f.write("property double y\n")
+        f.write("property double z\n")
+        f.write("element face 0\n")
+        f.write("property list uchar uint vertex_indices\n")
+        f.write("end_header\n")
+
+
 def _export_metric_meshes_by_class(
     comps: List[Comp],
     metric_by_guid: Dict[str, float],
@@ -436,6 +451,48 @@ def _metric_map_by_guid(
             continue
         mapping[str(guid)] = _safe_float(row.get(value_key, 0.0), default=0.0)
     return mapping
+
+
+def _export_class_meshes(
+    spaces: List[Comp],
+    elems: List[Comp],
+    output_dir: str,
+    classes: List[str],
+    type_aliases: Optional[Dict[str, str]] = None
+) -> List[Dict[str, Any]]:
+    """
+    Export uncolored, combined meshes per requested class.
+    If a class has no geometry, an empty PLY is still written for consistency.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    aliases = type_aliases or {}
+
+    groups: Dict[str, List[Comp]] = {c: [] for c in classes}
+    if "IfcSpace" in groups:
+        groups["IfcSpace"].extend(spaces or [])
+
+    for comp in elems or []:
+        etype = aliases.get(comp.etype, comp.etype)
+        if etype in groups:
+            groups[etype].append(comp)
+
+    exports: List[Dict[str, Any]] = []
+    for etype in classes:
+        comps = groups.get(etype, [])
+        meshes = [c.mesh for c in comps if getattr(c, "mesh", None) is not None]
+        filename = f"{_sanitize_for_filename(etype, fallback='IfcType')}.ply"
+        path = os.path.join(output_dir, filename)
+        if meshes:
+            _write_combined_mesh(meshes, path)
+        else:
+            _write_empty_ply(path)
+        exports.append({
+            "ifc_type": etype,
+            "count": int(len(comps)),
+            "path": path
+        })
+
+    return exports
 
 
 def _export_space_meshes_for_round(
@@ -2731,45 +2788,117 @@ def main():
 
     try:
         metric_mesh_dir = os.path.join(mesh_output_dir_abs, "metrics")
-        local_round = rounds.get("local") or {}
-        per_gt_local = local_round.get("per_gt") or []
-        per_pred_local = local_round.get("per_pred") or []
-
-        iou_gt_map = _metric_map_by_guid(per_gt_local, "gt_guid", "iou_union_pred_vs_gt")
-        iou_pred_map = _metric_map_by_guid(per_pred_local, "pred_guid", "iou_union_gt_vs_pred")
-        comp_gt_map = _metric_map_by_guid(per_gt_local, "gt_guid", "local_compactness_gt_to_pred")
-        comp_pred_map = _metric_map_by_guid(per_pred_local, "pred_guid", "local_compactness_pred_to_gt")
-
-        iou_root = os.path.join(metric_mesh_dir, "3DIou")
-        iou_gt_dir = os.path.join(iou_root, "gt")
-        iou_pred_dir = os.path.join(iou_root, "pred")
-        comp_gt_dir = os.path.join(metric_mesh_dir, "3Dcompactness_gt")
-        comp_pred_dir = os.path.join(metric_mesh_dir, "3Dcompactness_pred")
+        gt_comps_all = list(elems_gt) + list(spaces_gt)
 
         log_step(f"Exporting metric meshes to {metric_mesh_dir}")
-        report_mesh_exports["metrics"] = {
+        metrics_export_report: Dict[str, Any] = {
             "directory": metric_mesh_dir,
-            "3DIou": {
-                "gt": {
-                    "directory": iou_gt_dir,
-                    "by_class": _export_metric_meshes_by_class(elems_gt, iou_gt_map, iou_gt_dir)
+            "rounds": {}
+        }
+
+        for round_label in ("global", "local"):
+            round_data = rounds.get(round_label) or {}
+            if not round_data:
+                continue
+
+            if round_label == "global":
+                pred_elems = elems_pr_global_aligned
+                pred_spaces = spaces_pr_global_aligned
+            else:
+                pred_elems = elems_pr
+                pred_spaces = spaces_pr
+
+            pred_comps_all = list(pred_elems) + list(pred_spaces)
+
+            per_gt_round = round_data.get("per_gt") or []
+            per_pred_round = round_data.get("per_pred") or []
+
+            iou_gt_map = _metric_map_by_guid(per_gt_round, "gt_guid", "iou_union_pred_vs_gt")
+            iou_pred_map = _metric_map_by_guid(per_pred_round, "pred_guid", "iou_union_gt_vs_pred")
+            comp_gt_map = _metric_map_by_guid(per_gt_round, "gt_guid", "local_compactness_gt_to_pred")
+            comp_pred_map = _metric_map_by_guid(per_pred_round, "pred_guid", "local_compactness_pred_to_gt")
+
+            try:
+                space_metrics = compute_all_metrics(
+                    spaces_gt,
+                    pred_spaces,
+                    eps=float(space_match_thresh),
+                    inside_eps=inside_eps,
+                    max_k_for_ie=max_k_for_ie
+                )
+                iou_gt_map.update(_metric_map_by_guid(space_metrics.get("per_gt", []), "gt_guid", "iou_union_pred_vs_gt"))
+                iou_pred_map.update(_metric_map_by_guid(space_metrics.get("per_pred", []), "pred_guid", "iou_union_gt_vs_pred"))
+                comp_gt_map.update(_metric_map_by_guid(space_metrics.get("per_gt", []), "gt_guid", "local_compactness_gt_to_pred"))
+                comp_pred_map.update(_metric_map_by_guid(space_metrics.get("per_pred", []), "pred_guid", "local_compactness_pred_to_gt"))
+            except Exception as exc:
+                log_step(f"  Space metric computation failed for round '{round_label}': {exc}")
+
+            round_dir = os.path.join(metric_mesh_dir, round_label)
+            iou_root = os.path.join(round_dir, "3DIou")
+            iou_gt_dir = os.path.join(iou_root, "gt")
+            iou_pred_dir = os.path.join(iou_root, "pred")
+            comp_gt_dir = os.path.join(round_dir, "3Dcompactness_gt")
+            comp_pred_dir = os.path.join(round_dir, "3Dcompactness_pred")
+
+            metrics_export_report["rounds"][round_label] = {
+                "directory": round_dir,
+                "3DIou": {
+                    "gt": {
+                        "directory": iou_gt_dir,
+                        "by_class": _export_metric_meshes_by_class(gt_comps_all, iou_gt_map, iou_gt_dir)
+                    },
+                    "pred": {
+                        "directory": iou_pred_dir,
+                        "by_class": _export_metric_meshes_by_class(pred_comps_all, iou_pred_map, iou_pred_dir)
+                    }
                 },
-                "pred": {
-                    "directory": iou_pred_dir,
-                    "by_class": _export_metric_meshes_by_class(elems_pr, iou_pred_map, iou_pred_dir)
+                "3Dcompactness_gt": {
+                    "directory": comp_gt_dir,
+                    "by_class": _export_metric_meshes_by_class(gt_comps_all, comp_gt_map, comp_gt_dir)
+                },
+                "3Dcompactness_pred": {
+                    "directory": comp_pred_dir,
+                    "by_class": _export_metric_meshes_by_class(pred_comps_all, comp_pred_map, comp_pred_dir)
                 }
+            }
+
+        report_mesh_exports["metrics"] = metrics_export_report
+    except Exception as exc:
+        log_step(f"Metric mesh export failed: {exc}")
+
+    try:
+        class_mesh_dir = os.path.join(mesh_output_dir_abs, "classes")
+        gt_class_dir = os.path.join(class_mesh_dir, "gt")
+        pred_class_dir = os.path.join(class_mesh_dir, "pred")
+        requested_classes = ["IfcSpace", "IfcWall", "IfcWindow", "IfcDoor"]
+        type_aliases = {"IfcWallStandardCase": "IfcWall"}
+
+        log_step(f"Exporting uncolored class meshes to {class_mesh_dir}")
+        report_mesh_exports["classes"] = {
+            "directory": class_mesh_dir,
+            "gt": {
+                "directory": gt_class_dir,
+                "by_class": _export_class_meshes(
+                    spaces_gt,
+                    elems_gt,
+                    gt_class_dir,
+                    requested_classes,
+                    type_aliases=type_aliases
+                )
             },
-            "3Dcompactness_gt": {
-                "directory": comp_gt_dir,
-                "by_class": _export_metric_meshes_by_class(elems_gt, comp_gt_map, comp_gt_dir)
-            },
-            "3Dcompactness_pred": {
-                "directory": comp_pred_dir,
-                "by_class": _export_metric_meshes_by_class(elems_pr, comp_pred_map, comp_pred_dir)
+            "pred": {
+                "directory": pred_class_dir,
+                "by_class": _export_class_meshes(
+                    spaces_pr,
+                    elems_pr,
+                    pred_class_dir,
+                    requested_classes,
+                    type_aliases=type_aliases
+                )
             }
         }
     except Exception as exc:
-        log_step(f"Metric mesh export failed: {exc}")
+        log_step(f"Class mesh export failed: {exc}")
 
     report: Dict[str, Any] = {
         "config": report_config,
