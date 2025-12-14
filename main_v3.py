@@ -1910,6 +1910,24 @@ def _o3d_transform_inplace(comps: List[Comp], T: np.ndarray) -> None:
 def _aabb_overlap(a_min, a_max, b_min, b_max) -> bool:
     return np.all(a_min <= b_max) and np.all(b_min <= a_max) and np.all(a_max >= b_min) and np.all(b_max >= a_min)
 
+_WALL_FAMILY_TYPES: Set[str] = {"IfcWall", "IfcWallStandardCase"}
+
+
+def _ifc_types_compatible_for_matching(gt_ifc_type: str, pred_ifc_type: str) -> bool:
+    """
+    Element-to-element comparisons for IoU/compactness must be class-consistent.
+
+    Rules:
+    - Default: only compare same IFC entity type (e.g., IfcDoor <-> IfcDoor).
+    - Exception: IfcWall and IfcWallStandardCase are treated as compatible both ways.
+    """
+    if not gt_ifc_type or not pred_ifc_type:
+        return False
+    if gt_ifc_type == pred_ifc_type:
+        return True
+    return (gt_ifc_type in _WALL_FAMILY_TYPES) and (pred_ifc_type in _WALL_FAMILY_TYPES)
+
+
 def _pairwise_iou(gt: List[Comp], pr: List[Comp], eps: float, inside_eps: float = 1e-7) -> np.ndarray:
     m, n = len(gt), len(pr)
     log_step(f"Computing pairwise IoU matrix ({m}x{n}) using OBB intersection/union")
@@ -1917,6 +1935,8 @@ def _pairwise_iou(gt: List[Comp], pr: List[Comp], eps: float, inside_eps: float 
     progress_stride = max(1, min(50, (m // 10) or 5))
     for i, g in enumerate(gt):
         for j, p in enumerate(pr):
+            if not _ifc_types_compatible_for_matching(g.etype, p.etype):
+                continue
             if not _aabb_overlap(g.aabb_min, g.aabb_max, p.aabb_min, p.aabb_max):
                 continue
             v = iou_between_two_obbs(g.obb, p.obb, eps=inside_eps)
