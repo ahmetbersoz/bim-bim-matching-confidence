@@ -2406,18 +2406,17 @@ def main():
     # Default CLI arguments for convenience (used only when no CLI args are provided)
     DEFAULT_ARGS = [
         "--gt", ".\\input\\WW_revit_model_v6_w_spaces.ifc",
-        "--pred", ".\\input\\ww-v3-ifc4-geo.ifc",
-        "--target-space-guid", "1UABPD7uD69BRTD38UZ2$I",
-        # "--target-space-guid", "1UABPD7uD69BRTD38UZ2$e",
+        "--pred", ".\\input\\ww-v1-ifc4-geo.ifc",
+        # "--target-space-guid", "1UABPD7uD69BRTD38UZ2$I",
         "--mesh-output-dir", "out",
         "--floor-area-csv", "out/matched_space_floor_areas.csv",
         "--align", "centroid",
-        "--space-align", "icp",
+        "--space-align", "none",
         "--space-match-thresh", "0.25",
         "--epsilon", "0.10",
         "--save-json", "metrics_obb.json",
         "--save-csv-prefix", "out/metrics_obb",
-        "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace", "IfcDoor", "IfcWindow", "IfcOpening",
+        "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace", "IfcDoor", "IfcWindow",
         "--include-unmatched", "ignore",
     ]
 
@@ -2730,44 +2729,58 @@ def main():
     }
 
     try:
-        metric_mesh_dir = os.path.join(mesh_output_dir_abs, "metrics")
-        local_round = rounds.get("local") or {}
-        per_gt_local = local_round.get("per_gt") or []
-        per_pred_local = local_round.get("per_pred") or []
+        metric_mesh_root_dir = os.path.join(mesh_output_dir_abs, "metrics")
+        os.makedirs(metric_mesh_root_dir, exist_ok=True)
 
-        iou_gt_map = _metric_map_by_guid(per_gt_local, "gt_guid", "iou_union_pred_vs_gt")
-        iou_pred_map = _metric_map_by_guid(per_pred_local, "pred_guid", "iou_union_gt_vs_pred")
-        comp_gt_map = _metric_map_by_guid(per_gt_local, "gt_guid", "local_compactness_gt_to_pred")
-        comp_pred_map = _metric_map_by_guid(per_pred_local, "pred_guid", "local_compactness_pred_to_gt")
+        def _export_metric_meshes_for_round(round_label: str, pred_elems: List[Comp]) -> Dict[str, Any]:
+            round_data = rounds.get(round_label) or {}
+            per_gt = round_data.get("per_gt") or []
+            per_pred = round_data.get("per_pred") or []
 
-        iou_root = os.path.join(metric_mesh_dir, "3DIou")
-        iou_gt_dir = os.path.join(iou_root, "gt")
-        iou_pred_dir = os.path.join(iou_root, "pred")
-        comp_gt_dir = os.path.join(metric_mesh_dir, "3Dcompactness_gt")
-        comp_pred_dir = os.path.join(metric_mesh_dir, "3Dcompactness_pred")
+            iou_gt_map = _metric_map_by_guid(per_gt, "gt_guid", "iou_union_pred_vs_gt")
+            iou_pred_map = _metric_map_by_guid(per_pred, "pred_guid", "iou_union_gt_vs_pred")
+            comp_gt_map = _metric_map_by_guid(per_gt, "gt_guid", "local_compactness_gt_to_pred")
+            comp_pred_map = _metric_map_by_guid(per_pred, "pred_guid", "local_compactness_pred_to_gt")
 
-        log_step(f"Exporting metric meshes to {metric_mesh_dir}")
-        report_mesh_exports["metrics"] = {
-            "directory": metric_mesh_dir,
-            "3DIou": {
-                "gt": {
-                    "directory": iou_gt_dir,
-                    "by_class": _export_metric_meshes_by_class(elems_gt, iou_gt_map, iou_gt_dir)
+            round_mesh_dir = os.path.join(metric_mesh_root_dir, f"{round_label}_round")
+            iou_root = os.path.join(round_mesh_dir, "3DIou")
+            iou_gt_dir = os.path.join(iou_root, "gt")
+            iou_pred_dir = os.path.join(iou_root, "pred")
+            comp_gt_dir = os.path.join(round_mesh_dir, "3Dcompactness_gt")
+            comp_pred_dir = os.path.join(round_mesh_dir, "3Dcompactness_pred")
+
+            log_step(f"Exporting metric meshes for '{round_label}' round to {round_mesh_dir}")
+            return {
+                "directory": round_mesh_dir,
+                "3DIou": {
+                    "gt": {
+                        "directory": iou_gt_dir,
+                        "by_class": _export_metric_meshes_by_class(elems_gt, iou_gt_map, iou_gt_dir)
+                    },
+                    "pred": {
+                        "directory": iou_pred_dir,
+                        "by_class": _export_metric_meshes_by_class(pred_elems, iou_pred_map, iou_pred_dir)
+                    }
                 },
-                "pred": {
-                    "directory": iou_pred_dir,
-                    "by_class": _export_metric_meshes_by_class(elems_pr, iou_pred_map, iou_pred_dir)
+                "3Dcompactness_gt": {
+                    "directory": comp_gt_dir,
+                    "by_class": _export_metric_meshes_by_class(elems_gt, comp_gt_map, comp_gt_dir)
+                },
+                "3Dcompactness_pred": {
+                    "directory": comp_pred_dir,
+                    "by_class": _export_metric_meshes_by_class(pred_elems, comp_pred_map, comp_pred_dir)
                 }
-            },
-            "3Dcompactness_gt": {
-                "directory": comp_gt_dir,
-                "by_class": _export_metric_meshes_by_class(elems_gt, comp_gt_map, comp_gt_dir)
-            },
-            "3Dcompactness_pred": {
-                "directory": comp_pred_dir,
-                "by_class": _export_metric_meshes_by_class(elems_pr, comp_pred_map, comp_pred_dir)
             }
-        }
+
+        report_mesh_exports["metrics"] = {"directory": metric_mesh_root_dir, "rounds": {}}
+        report_mesh_exports["metrics"]["rounds"]["global"] = _export_metric_meshes_for_round(
+            "global",
+            elems_pr_global_aligned
+        )
+        report_mesh_exports["metrics"]["rounds"]["local"] = _export_metric_meshes_for_round(
+            "local",
+            elems_pr
+        )
     except Exception as exc:
         log_step(f"Metric mesh export failed: {exc}")
 
