@@ -1785,6 +1785,19 @@ def _compute_round_element_metrics(
     gt_for_report = [elems_gt[idx] for idx in included_gt_indices_sorted]
     pr_for_report = [elems_pr[idx] for idx in included_pr_indices_sorted]
 
+    if not gt_for_report and elems_gt and include_unmatched_mode == "ignore":
+        log_step(
+            "WARNING: No GT elements were included in per-element metrics for this round. "
+            "This commonly happens when GT elements are not linked to spaces and --include-unmatched is 'ignore'. "
+            "Try --include-unmatched global."
+        )
+    if not pr_for_report and elems_pr and include_unmatched_mode == "ignore":
+        log_step(
+            "WARNING: No PRED elements were included in per-element metrics for this round. "
+            "This commonly happens when PRED elements are not linked to spaces and --include-unmatched is 'ignore'. "
+            "Try --include-unmatched global."
+        )
+
     global_metrics = compute_all_metrics(
         gt_for_report,
         pr_for_report,
@@ -2405,41 +2418,59 @@ def main():
     ap.add_argument("--inside-eps", type=float, default=1e-7, help="Tolerance for half-space tests / plane membership.")
     ap.add_argument("--ie-cap", type=int, default=8, help="Max K for exact inclusion-exclusion before pairwise approximation.")
 
-    # # Default CLI arguments for convenience (used only when no CLI args are provided)
-    # DEFAULT_ARGS = [
-    #     "--gt", ".\\input\\JohnMuir_revit_rotated_spaces_1st.ifc",
-    #     "--pred", ".\\input\\john-muir-1st-v1-ifc4-geo-rotated.ifc",
-    #     # "--target-space-guid", "1663O7_YHCi8qg8Qi5si4a",
-    #     # "--target-space-guid", "1663O7_YHCi8qg8Qi5si4R",
-    #     "--mesh-output-dir", "out",
-    #     "--floor-area-csv", "out/matched_space_floor_areas.csv",
-    #     "--align", "centroid",
-    #     "--space-align", "icp",
-    #     "--space-match-thresh", "0.25",
-    #     "--epsilon", "0.10",
-    #     "--save-json", "metrics_obb.json",
-    #     "--save-csv-prefix", "out/metrics_obb",
-    #     "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace",
-    #     "--include-unmatched", "ignore",
-    # ]
 
     # Default CLI arguments for convenience (used only when no CLI args are provided)
     DEFAULT_ARGS = [
-        "--gt", ".\\input\\WW_revit_model_v6_w_spaces.ifc",
-        "--pred", ".\\input\\ww-v1-ifc4-geo.ifc",
-        # "--target-space-guid", "1UABPD7uD69BRTD38UZ2$I",
+        "--gt", "./input/JM_1st_floor_w_spaces.ifc",
+        "--pred", "./input/john-muir-1st-v2-ifc4-geo-rotated.ifc",
+        # "--target-space-guid", "1663O7_YHCi8qg8Qi5si4r", #gt-space
+        # "--target-space-guid", "0UhoA17yvDzgPS6x1bHitJ", #pred-space
         "--mesh-output-dir", "out",
         "--floor-area-csv", "out/matched_space_floor_areas.csv",
         "--align", "centroid",
-        "--space-align", "none",
+        "--space-align", "icp",
         "--space-match-thresh", "0.25",
         "--epsilon", "0.10",
         "--save-json", "metrics_obb.json",
         "--save-csv-prefix", "out/metrics_obb",
-        "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace", "IfcDoor", "IfcWindow",
+        "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace",
         "--include-unmatched", "ignore",
     ]
 
+    # # Default CLI arguments for convenience (used only when no CLI args are provided)
+    # DEFAULT_ARGS = [
+    #     "--gt", ".\\input\\JohnMuir_revit_rotated_spaces_1st.ifc",
+    #     "--pred", ".\\input\\john-muir-1st-v1-ifc4-geo-rotated.ifc",
+    #     "--target-space-guid", "1663O7_YHCi8qg8Qi5si4a",
+    #     # "--target-space-guid", "1663O7_YHCi8qg8Qi5si4R",
+    #     "--mesh-output-dir", "out",
+    #     "--floor-area-csv", "out/matched_space_floor_areas.csv",
+    #     "--align", "icp",
+    #     "--space-align", "none",
+    #     "--space-match-thresh", "0.25",
+    #     "--epsilon", "0.10",
+    #     "--save-json", "metrics_obb.json",
+    #     "--save-csv-prefix", "out/metrics_obb",
+    #     "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace", "IfcDoor", "IfcWindow",
+    #     "--include-unmatched", "ignore",
+    # ]
+
+    # # Default CLI arguments for convenience (used only when no CLI args are provided)
+    # DEFAULT_ARGS = [
+    #     "--gt", ".\\input\\WW_revit_model_v6_w_spaces.ifc",
+    #     "--pred", ".\\input\\ww-v1-ifc4-geo.ifc",
+    #     # "--target-space-guid", "1UABPD7uD69BRTD38UZ2$I",
+    #     "--mesh-output-dir", "out",
+    #     "--floor-area-csv", "out/matched_space_floor_areas.csv",
+    #     "--align", "centroid",
+    #     "--space-align", "none",
+    #     "--space-match-thresh", "0.25",
+    #     "--epsilon", "0.10",
+    #     "--save-json", "metrics_obb.json",
+    #     "--save-csv-prefix", "out/metrics_obb",
+    #     "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace", "IfcDoor", "IfcWindow",
+    #     "--include-unmatched", "ignore",
+    # ]
 
     if len(sys.argv) == 1:
         log_step(f"No CLI arguments detected - using DEFAULT_ARGS: {' '.join(DEFAULT_ARGS)}")
@@ -2478,6 +2509,13 @@ def main():
         include_types_for_elements=args.ifc_classes
     )
     log_step(f"  GT spaces loaded: {len(spaces_gt)} | elements: {len(elems_gt)}")
+    gt_elements_without_space = sum(1 for comp in elems_gt if not elem_guid_to_space_gt.get(comp.guid))
+    if elems_gt and gt_elements_without_space == len(elems_gt) and args.include_unmatched == "ignore":
+        log_step(
+            "WARNING: 100% of GT elements have no associated IfcSpace; with --include-unmatched ignore, "
+            "`metrics_obb_*_per_gt.csv` will be empty. Use --include-unmatched global or provide an IFC "
+            "with element-to-space relationships."
+        )
 
     # Display GT spaces before any alignment
     _print_spaces_summary("GT (before alignment)", spaces_gt)
@@ -2493,6 +2531,13 @@ def main():
         include_types_for_elements=args.ifc_classes
     )
     log_step(f"  PRED spaces loaded: {len(spaces_pr)} | elements: {len(elems_pr)}")
+    pred_elements_without_space = sum(1 for comp in elems_pr if not elem_guid_to_space_pr.get(comp.guid))
+    if elems_pr and pred_elements_without_space == len(elems_pr) and args.include_unmatched == "ignore":
+        log_step(
+            "WARNING: 100% of PRED elements have no associated IfcSpace; with --include-unmatched ignore, "
+            "per-element metrics will be empty. Use --include-unmatched global or provide an IFC with "
+            "element-to-space relationships."
+        )
 
     # Display PRED spaces before any alignment
     _print_spaces_summary("PRED (before alignment)", spaces_pr)
