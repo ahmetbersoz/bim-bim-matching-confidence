@@ -1346,48 +1346,60 @@ def build_space_membership(
     except Exception:
         pass
 
-    try:
-        BOUNDARY_TYPES = (
-            "IfcRelSpaceBoundary2ndLevel",
-            "IfcRelSpaceBoundary1stLevel",
-            "IfcRelSpaceBoundary",
-        )
+    BOUNDARY_TYPES = (
+        "IfcRelSpaceBoundary2ndLevel",
+        "IfcRelSpaceBoundary1stLevel",
+        "IfcRelSpaceBoundary",
+    )
 
-        for t in BOUNDARY_TYPES:
-            for rsb in ifc.by_type(t):
-                sp = getattr(rsb, "RelatingSpace", None)
-                el = getattr(rsb, "RelatedBuildingElement", None)
-                if sp is None or el is None:
-                    # space-to-space or virtual boundaries; nothing to add
-                    continue
+    added_any_boundary_memberships = False
+    for t in BOUNDARY_TYPES:
+        try:
+            rsbs = ifc.by_type(t)
+        except Exception as exc:
+            # IFC2X3 does not define the 1st/2nd level boundary entities; keep going so that
+            # IfcRelSpaceBoundary can still be processed.
+            log_step(f"  Skipping {t} membership lookup: {exc}")
+            continue
 
-                space_guid = _guid_or_id(sp)
-                if space_guid not in space_guid_to_elem_indices:
-                    continue
+        for rsb in rsbs:
+            sp = getattr(rsb, "RelatingSpace", None)
+            el = getattr(rsb, "RelatedBuildingElement", None)
+            if sp is None or el is None:
+                # space-to-space or virtual boundaries; nothing to add
+                continue
 
-                elem_guid = _guid_or_id(el)
+            space_guid = _guid_or_id(sp)
+            if space_guid not in space_guid_to_elem_indices:
+                continue
 
-                # If the exact element GUID isn’t in our elements list (because of include_types
-                # filtering or decomposition), try bubbling up to a parent that *is* in the list.
-                idx = elem_guid_to_index.get(elem_guid)
-                if idx is None:
-                    try:
-                        # el.Decomposes -> parents (assemblies)
-                        parents = getattr(el, "Decomposes", None) or []
-                        for rel in parents:
-                            par = getattr(rel, "RelatingObject", None)
-                            if par:
-                                par_guid = _guid_or_id(par)
-                                if par_guid in elem_guid_to_index:
-                                    elem_guid = par_guid
-                                    break
-                    except Exception:
-                        pass
+            elem_guid = _guid_or_id(el)
 
-                record_membership(space_guid, elem_guid)
+            # If the exact element GUID isn’t in our elements list (because of include_types
+            # filtering or decomposition), try bubbling up to a parent that *is* in the list.
+            idx = elem_guid_to_index.get(elem_guid)
+            if idx is None:
+                try:
+                    # el.Decomposes -> parents (assemblies)
+                    parents = getattr(el, "Decomposes", None) or []
+                    for rel in parents:
+                        par = getattr(rel, "RelatingObject", None)
+                        if par:
+                            par_guid = _guid_or_id(par)
+                            if par_guid in elem_guid_to_index:
+                                elem_guid = par_guid
+                                break
+                except Exception:
+                    pass
+
+            before = len(space_guid_to_elem_indices.get(space_guid, []))
+            record_membership(space_guid, elem_guid)
+            after = len(space_guid_to_elem_indices.get(space_guid, []))
+            if after > before:
+                added_any_boundary_memberships = True
+
+    if added_any_boundary_memberships:
         log_step("  Added memberships from IfcRelSpaceBoundary*")
-    except Exception as exc:
-        log_step(f"  Membership via IfcRelSpaceBoundary* failed: {exc}")
 
     # Ensure deterministic ordering of element indices in each space.
     for guid, lst in space_guid_to_elem_indices.items():
@@ -2418,24 +2430,40 @@ def main():
     ap.add_argument("--inside-eps", type=float, default=1e-7, help="Tolerance for half-space tests / plane membership.")
     ap.add_argument("--ie-cap", type=int, default=8, help="Max K for exact inclusion-exclusion before pairwise approximation.")
 
-
     # Default CLI arguments for convenience (used only when no CLI args are provided)
     DEFAULT_ARGS = [
-        "--gt", "./input/JM_1st_floor_w_spaces.ifc",
-        "--pred", "./input/john-muir-1st-v2-ifc4-geo-rotated.ifc",
-        # "--target-space-guid", "1663O7_YHCi8qg8Qi5si4r", #gt-space
-        # "--target-space-guid", "0UhoA17yvDzgPS6x1bHitJ", #pred-space
+        "--gt", "./input/JM_2nd_floor_w_spaces_updated.ifc",
+        "--pred", "./input/john-muir-2nd-v2-ifc4-geo-almost-rotated-clean.ifc",
+        "--target-space-guid", "1663O7_YHCi8qg8Qi5si4N", #gt-space
         "--mesh-output-dir", "out",
         "--floor-area-csv", "out/matched_space_floor_areas.csv",
         "--align", "centroid",
-        "--space-align", "icp",
+        "--space-align", "none",
         "--space-match-thresh", "0.25",
         "--epsilon", "0.10",
         "--save-json", "metrics_obb.json",
         "--save-csv-prefix", "out/metrics_obb",
-        "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace",
+        "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace", "IfcDoor", "IfcWindow",
         "--include-unmatched", "ignore",
     ]
+
+    # # Default CLI arguments for convenience (used only when no CLI args are provided)
+    # DEFAULT_ARGS = [
+    #     "--gt", "./input/JM_1st_floor_w_spaces.ifc",
+    #     "--pred", "./input/john-muir-1st-v2-ifc4-geo-rotated.ifc",
+    #     # "--target-space-guid", "1663O7_YHCi8qg8Qi5si4r", #gt-space
+    #     # "--target-space-guid", "0UhoA17yvDzgPS6x1bHitJ", #pred-space
+    #     "--mesh-output-dir", "out",
+    #     "--floor-area-csv", "out/matched_space_floor_areas.csv",
+    #     "--align", "centroid",
+    #     "--space-align", "none",
+    #     "--space-match-thresh", "0.25",
+    #     "--epsilon", "0.10",
+    #     "--save-json", "metrics_obb.json",
+    #     "--save-csv-prefix", "out/metrics_obb",
+    #     "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace", "IfcDoor", "IfcWindow",
+    #     "--include-unmatched", "ignore",
+    # ]
 
     # # Default CLI arguments for convenience (used only when no CLI args are provided)
     # DEFAULT_ARGS = [
