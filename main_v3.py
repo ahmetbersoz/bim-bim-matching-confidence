@@ -2406,8 +2406,9 @@ def main():
     ap = argparse.ArgumentParser(description="Per-element 3D-IoU & 3D-Compactness between two IFCs, with metadata. (OBB-only)")
     ap.add_argument("--gt", required=True, help="Path to ground-truth IFC.")
     ap.add_argument("--pred", required=True, help="Path to predicted/reconstructed IFC.")
-    ap.add_argument("--target-space-guid", required=False, default=None,
-                    help="(Optional) GlobalId of a GT IfcSpace used to derive the ICP refinement.")
+    ap.add_argument("--target-space-guid", "--align-space-guid", required=False, default=None,
+                    help="(Optional) GlobalId of a GT IfcSpace used to derive a global (model-wide) ICP refinement. "
+                         "When provided, per-space/local alignment (--space-align) is disabled.")
     ap.add_argument("--mesh-output-dir", type=str, default="out",
                     help="Directory to write combined GT and aligned PRED meshes.")
     ap.add_argument("--floor-area-csv", type=str, default="out/matched_space_floor_areas.csv",
@@ -2430,11 +2431,48 @@ def main():
     ap.add_argument("--inside-eps", type=float, default=1e-7, help="Tolerance for half-space tests / plane membership.")
     ap.add_argument("--ie-cap", type=int, default=8, help="Max K for exact inclusion-exclusion before pairwise approximation.")
 
+    # PAPER MODELS
+
+    # # Default CLI arguments for convenience (used only when no CLI args are provided)
+    # DEFAULT_ARGS = [
+    #     "--gt", "./input/JM_2nd_floor_w_spaces_updated.ifc",
+    #     "--pred", "./input/john-muir-2nd-v2-ifc4-geo-clean-autorotated.ifc",
+    #     "--target-space-guid", "1663O7_YHCi8qg8Qi5si4T", #gt-space
+    #     "--mesh-output-dir", "out",
+    #     "--floor-area-csv", "out/matched_space_floor_areas.csv",
+    #     "--align", "centroid",
+    #     "--space-align", "none",
+    #     "--space-match-thresh", "0.25",
+    #     "--epsilon", "0.10",
+    #     "--save-json", "metrics_obb.json",
+    #     "--save-csv-prefix", "out/metrics_obb",
+    #     "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace", "IfcDoor", "IfcWindow",
+    #     "--include-unmatched", "ignore",
+    # ]
+
+    # # Default CLI arguments for convenience (used only when no CLI args are provided)
+    # DEFAULT_ARGS = [
+    #     "--gt", "./input/JM_1st_floor_w_spaces.ifc",
+    #     "--pred", "./input/john-muir-1st-v2-ifc4-geo-autorotated.ifc",
+    #     "--target-space-guid", "1663O7_YHCi8qg8Qi5si4v", #gt-space
+    #     "--mesh-output-dir", "out",
+    #     "--floor-area-csv", "out/matched_space_floor_areas.csv",
+    #     "--align", "centroid",
+    #     "--space-align", "none",
+    #     "--space-match-thresh", "0.25",
+    #     "--epsilon", "0.10",
+    #     "--save-json", "metrics_obb.json",
+    #     "--save-csv-prefix", "out/metrics_obb",
+    #     "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace", "IfcDoor", "IfcWindow",
+    #     "--include-unmatched", "ignore",
+    # ]
+
+
     # Default CLI arguments for convenience (used only when no CLI args are provided)
     DEFAULT_ARGS = [
-        "--gt", "./input/JM_2nd_floor_w_spaces_updated.ifc",
-        "--pred", "./input/john-muir-2nd-v2-ifc4-geo-almost-rotated-clean.ifc",
-        "--target-space-guid", "1663O7_YHCi8qg8Qi5si4N", #gt-space
+        "--gt", ".\\input\\WW_revit_model_v6_w_spaces.ifc",
+        "--pred", ".\\input\\ww-v1-ifc4-geo.ifc",
+        "--target-space-guid", "1UABPD7uD69BRTD38UZ2$k",
         "--mesh-output-dir", "out",
         "--floor-area-csv", "out/matched_space_floor_areas.csv",
         "--align", "centroid",
@@ -2446,6 +2484,8 @@ def main():
         "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace", "IfcDoor", "IfcWindow",
         "--include-unmatched", "ignore",
     ]
+
+    
 
     # # Default CLI arguments for convenience (used only when no CLI args are provided)
     # DEFAULT_ARGS = [
@@ -2518,6 +2558,9 @@ def main():
         if align_lower != "centroid":
             log_step("Overriding --align to 'centroid' when a target space GUID is provided.")
             args.align = "centroid"
+        if args.space_align.lower() != "none":
+            log_step("Overriding --space-align to 'none' when a target space GUID is provided (global-only alignment).")
+            args.space_align = "none"
     else:
         if align_lower not in {"icp", "centroid"}:
             raise ValueError("When --target-space-guid is omitted, --align must be either 'icp' or 'centroid'.")
@@ -2749,7 +2792,7 @@ def main():
         eps,
         inside_eps,
         max_k_for_ie,
-        True,
+        local_apply_alignment,
         args.align
     )
 
