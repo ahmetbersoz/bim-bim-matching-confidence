@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-# ifc_metrics_with_metadata_obb.py
+# ifc_metrics_with_metadata_mesh.py
 # Compute per-element 3D-IoU & 3D-Compactness between two IFCs, preserving IFC metadata,
-# using ONLY Object-Oriented Bounding Boxes (OOBBs). No mesh booleans, no convex hulls.
+# using mesh boolean volumes on the actual triangle meshes (Open3D).
 #
 # - Loads IFCs with ifcopenshell
 # - Aligns PRED -> GT (ICP if available, else centroid translation; optional XY-only ICP)
-# - Builds pairwise IoU matrix using exact OBB intersection/union math
+# - Builds pairwise IoU matrix using mesh boolean intersection/union volumes
 # - Reports per-element metrics for *both* GT and PRED
 # - Preserves metadata (GlobalId, Name, Type, attributes, and Psets)
 
@@ -19,7 +19,6 @@ import re
 import sys
 from dataclasses import dataclass, asdict
 from datetime import datetime
-from itertools import combinations
 from typing import Any, Dict, List, Optional, Tuple, Set
 
 import numpy as np
@@ -42,6 +41,15 @@ try:
 except Exception:
     print("This script needs open3d. Try: pip install open3d", file=sys.stderr)
     raise
+
+# Optional: trimesh backend for robust mesh booleans (recommended on Windows when Open3D/VTK booleans fail).
+try:
+    import trimesh  # type: ignore
+
+    TRIMESH_OK = True
+except Exception:
+    trimesh = None  # type: ignore
+    TRIMESH_OK = False
 
 VERBOSE = True
 
@@ -688,75 +696,687 @@ def _intersection_vertices_from_planes(planes: List[Tuple[np.ndarray, float]], e
     return _dedup_points(pts, eps_inside)
 
 
-def intersection_volume_obbs(obbs: List[OBB], eps: float = 1e-7) -> float:
-    if not obbs:
+_MESH_BOOL_LOG_STATE = {
+    "trimesh_missing": False,
+    "trimesh_boolean_failed": False,
+    "raycast_missing": False,
+    "raycast_failed": False,
+}
+
+# IoU backend settings (populated from CLI in main()).
+# - auto: trimesh booleans if available, else raycast occupancy integration
+# - trimesh: force trimesh booleans (fails -> 0.0)
+# - raycast: force raycast occupancy integration (no booleans)
+IOU_BACKEND: str = "auto"
+
+# Raycast backend parameters (meters).
+IOU_RAYCAST_PITCH: float = 0.05
+IOU_RAYCAST_MAX_VOXELS: int = 2_000_000
+IOU_RAYCAST_CHUNK: int = 250_000
+
+# Internal caches (invalidated whenever meshes are transformed).
+_TRIMESH_CACHE: Dict[int, Any] = {}
+_RAYCAST_SCENE_CACHE: Dict[int, Any] = {}
+
+
+def _clear_mesh_iou_caches() -> None:
+    _TRIMESH_CACHE.clear()
+    _RAYCAST_SCENE_CACHE.clear()
+
+
+def legacy_to_tensor_minimal(legacy_mesh: o3d.geometry.TriangleMesh) -> o3d.t.geometry.TriangleMesh:
+    """
+    Convert an Open3D legacy TriangleMesh to a minimal tensor TriangleMesh containing only:
+      - vertex.positions
+      - triangle.indices
+    This avoids attribute-related boolean issues across Open3D versions.
+    """
+    vp = o3d.core.Tensor(np.asarray(legacy_mesh.vertices), o3d.core.Dtype.Float32)
+    ti = o3d.core.Tensor(np.asarray(legacy_mesh.triangles), o3d.core.Dtype.Int64)
+    return o3d.t.geometry.TriangleMesh(vp, ti)
+
+
+def drop_all_but_positions_indices(tm: Any) -> None:
+    """
+    Remove all vertex attributes except 'positions' and all triangle attributes except 'indices'.
+    Defensive across Open3D versions (TensorMap APIs can differ).
+    """
+
+    def _list_attr_map(attr_map: Any) -> List[str]:
+        try:
+            if hasattr(attr_map, "get_attribute_names") and callable(attr_map.get_attribute_names):
+                return list(attr_map.get_attribute_names())
+            if hasattr(attr_map, "attribute_names"):
+                try:
+                    return list(attr_map.attribute_names)
+                except Exception:
+                    pass
+            if isinstance(attr_map, dict):
+                return list(attr_map.keys())
+            keys_attr = getattr(attr_map, "keys", None)
+            if callable(keys_attr):
+                try:
+                    return list(keys_attr())
+                except Exception:
+                    pass
+            return []
+        except Exception:
+            return []
+
+    def _try_remove_attr(attr_map: Any, name: str) -> None:
+        for remover in (
+            getattr(attr_map, "remove_attribute", None),
+            getattr(attr_map, "pop", None),
+        ):
+            try:
+                if callable(remover):
+                    if remover.__name__ == "pop":
+                        remover(name, None)
+                    else:
+                        remover(name)
+                    return
+            except Exception:
+                pass
+        try:
+            del attr_map[name]
+            return
+        except Exception:
+            pass
+
+    try:
+        vmap = tm.vertex
+        for k in _list_attr_map(vmap):
+            if k != "positions":
+                _try_remove_attr(vmap, k)
+    except Exception:
+        pass
+
+    try:
+        tmap = tm.triangle
+        for k in _list_attr_map(tmap):
+            if k != "indices":
+                _try_remove_attr(tmap, k)
+    except Exception:
+        pass
+
+
+def _o3d_signed_volume(mesh: o3d.geometry.TriangleMesh) -> float:
+    """Signed volume via divergence theorem (assumes a closed, consistently-oriented surface)."""
+    if mesh is None or len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
         return 0.0
-    if len(obbs) == 1:
-        return _obb_volume(obbs[0])
-    planes: List[Tuple[np.ndarray, float]] = []
-    for obb in obbs:
-        planes.extend(obb.planes)
-    verts = _intersection_vertices_from_planes(planes, eps_inside=eps)
-    if verts.shape[0] < 4:
+    V = np.asarray(mesh.vertices, dtype=np.float64)
+    F = np.asarray(mesh.triangles, dtype=np.int64)
+    if V.size == 0 or F.size == 0:
         return 0.0
-    return _polyhedron_volume_from_planes_and_vertices(planes, verts, eps_on_plane=10 * eps)
+    # Recenter to improve numerical stability for large-coordinate BIM models.
+    try:
+        ref = V.mean(axis=0)
+        if ref.shape == (3,) and np.all(np.isfinite(ref)):
+            V = V - ref
+    except Exception:
+        pass
+
+    v0 = V[F[:, 0]]
+    v1 = V[F[:, 1]]
+    v2 = V[F[:, 2]]
+    cross = np.cross(v1, v2)
+    vol = np.einsum("ij,ij->i", v0, cross).sum() / 6.0
+    return float(vol)
 
 
-def union_volume_obbs(obbs: List[OBB], eps: float = 1e-7, max_k_for_ie: int = 8) -> float:
-    k = len(obbs)
-    if k == 0:
+def _o3d_clean_mesh_for_volume(mesh: o3d.geometry.TriangleMesh) -> None:
+    # Best-effort cleanup before volume computation; avoid aggressive topology edits.
+    try:
+        mesh.remove_duplicated_vertices()
+        mesh.remove_degenerate_triangles()
+        mesh.remove_duplicated_triangles()
+        try:
+            mesh.remove_unreferenced_vertices()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def mesh_volume(mesh: o3d.geometry.TriangleMesh) -> float:
+    """
+    Compute the (positive) enclosed volume of a triangle mesh using the actual mesh geometry.
+    Requires a (mostly) watertight surface for meaningful results.
+    """
+    if mesh is None or len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
         return 0.0
-    if k == 1:
-        return _obb_volume(obbs[0])
+    m = _o3d_mesh_copy(mesh)
+    _o3d_clean_mesh_for_volume(m)
+    try:
+        if m.is_orientable():
+            m.orient_triangles()
+    except Exception:
+        pass
 
-    if k > max_k_for_ie:
-        # Approximate: sum vols minus pairwise intersections only.
-        vol = sum(_obb_volume(o) for o in obbs)
-        pair = 0.0
-        for a, b in combinations(obbs, 2):
-            pair += intersection_volume_obbs([a, b], eps)
-        return max(0.0, vol - pair)
+    # Avoid calling Open3D's TriangleMesh.get_volume() because it emits a hard error log
+    # for meshes it considers non-watertight (even if downstream volume is still computable).
+    try:
+        vol = float(abs(_o3d_signed_volume(m)))
+        return vol if math.isfinite(vol) else 0.0
+    except Exception:
+        pass
 
-    total = 0.0
-    for r in range(1, k + 1):
-        sign = 1.0 if (r % 2 == 1) else -1.0
-        for combo in combinations(obbs, r):
-            total += sign * intersection_volume_obbs(list(combo), eps)
-    return max(0.0, float(total))
+    # Optional fallback: trimesh (if installed) can sometimes compute volumes more robustly.
+    try:
+        import trimesh  # type: ignore
 
-
-def iou_between_two_obbs(a: OBB, b: OBB, eps: float = 1e-7) -> float:
-    inter = intersection_volume_obbs([a, b], eps)
-    if inter <= 0.0:
-        return 0.0
-    va = _obb_volume(a)
-    vb = _obb_volume(b)
-    union = va + vb - inter
-    return float(inter / union) if union > 0 else 0.0
-
-
-def iou_union_of_set_vs_single(set_obbs: List[OBB], ref_obb: OBB, eps: float = 1e-7, max_k_for_ie: int = 8) -> float:
-    if not set_obbs:
+        V = np.asarray(m.vertices, dtype=np.float64)
+        F = np.asarray(m.triangles, dtype=np.int64)
+        tm = trimesh.Trimesh(vertices=V, faces=F, process=True)
+        vol = float(abs(tm.volume))
+        return vol if math.isfinite(vol) else 0.0
+    except Exception:
         return 0.0
 
-    m = len(set_obbs)
-    cap = max_k_for_ie
-    if m > cap:
-        set_obbs = set_obbs[:cap]
-        m = cap
 
-    # numerator: union over intersections with ref
-    num = 0.0
-    for r in range(1, m + 1):
-        sign = 1.0 if (r % 2 == 1) else -1.0
-        for combo in combinations(set_obbs, r):
-            num += sign * intersection_volume_obbs([ref_obb, *combo], eps)
+def _o3d_to_trimesh_cached(mesh: o3d.geometry.TriangleMesh) -> Optional[Any]:
+    if not TRIMESH_OK:
+        if not _MESH_BOOL_LOG_STATE["trimesh_missing"]:
+            log_step("  Trimesh not available; falling back to raycast IoU where needed.")
+            _MESH_BOOL_LOG_STATE["trimesh_missing"] = True
+        return None
+    if mesh is None or len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
+        return None
 
-    # denominator: union over ref + all in set
-    den = union_volume_obbs([ref_obb] + set_obbs, eps=eps, max_k_for_ie=max_k_for_ie)
-    if den <= 0.0:
+    key = id(mesh)
+    cached = _TRIMESH_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    try:
+        vertices = np.asarray(mesh.vertices, dtype=np.float64)
+        faces = np.asarray(mesh.triangles, dtype=np.int64)
+        if vertices.size == 0 or faces.size == 0:
+            return None
+        tm = trimesh.Trimesh(vertices=vertices, faces=faces, process=False, maintain_order=True)  # type: ignore[attr-defined]
+        try:
+            tm.remove_duplicate_faces()
+            tm.remove_degenerate_faces()
+            tm.remove_unreferenced_vertices()
+            tm.remove_infinite_values()
+            tm.remove_nan()
+        except Exception:
+            pass
+        _TRIMESH_CACHE[key] = tm
+        return tm
+    except Exception:
+        return None
+
+
+def _collapse_trimesh_result(result: Any) -> Optional[Any]:
+    """Normalize trimesh boolean outputs into a single Trimesh instance."""
+    if not TRIMESH_OK or result is None:
+        return None
+    try:
+        if isinstance(result, trimesh.Trimesh):  # type: ignore[attr-defined]
+            return result
+        if isinstance(result, (list, tuple)):
+            meshes = [m for m in result if isinstance(m, trimesh.Trimesh) and len(getattr(m, "faces", [])) > 0]  # type: ignore[attr-defined]
+            if not meshes:
+                return None
+            if len(meshes) == 1:
+                return meshes[0]
+            try:
+                return trimesh.util.concatenate(meshes)  # type: ignore[attr-defined]
+            except Exception:
+                return meshes[0]
+        if isinstance(result, trimesh.Scene):  # type: ignore[attr-defined]
+            try:
+                collapsed = result.dump(concatenate=True)
+                return _collapse_trimesh_result(collapsed)
+            except Exception:
+                try:
+                    meshes = [g for g in result.geometry.values() if isinstance(g, trimesh.Trimesh)]  # type: ignore[attr-defined]
+                    if not meshes:
+                        return None
+                    if len(meshes) == 1:
+                        return meshes[0]
+                    return trimesh.util.concatenate(meshes)  # type: ignore[attr-defined]
+                except Exception:
+                    return None
+    except Exception:
+        return None
+    return None
+
+
+def _trimesh_volume(mesh: Any) -> float:
+    if not TRIMESH_OK or mesh is None:
         return 0.0
-    return float(max(0.0, num) / den)
+    try:
+        v = float(abs(mesh.volume))
+        return v if math.isfinite(v) else 0.0
+    except Exception:
+        pass
+    try:
+        V = np.asarray(mesh.vertices, dtype=np.float64)
+        F = np.asarray(mesh.faces, dtype=np.int64)
+        if V.size == 0 or F.size == 0:
+            return 0.0
+        ref = V.mean(axis=0)
+        if ref.shape == (3,) and np.all(np.isfinite(ref)):
+            V = V - ref
+        v0 = V[F[:, 0]]
+        v1 = V[F[:, 1]]
+        v2 = V[F[:, 2]]
+        vol = np.einsum("ij,ij->i", v0, np.cross(v1, v2)).sum() / 6.0
+        vol = float(abs(vol))
+        return vol if math.isfinite(vol) else 0.0
+    except Exception:
+        return 0.0
+
+
+def _trimesh_boolean_intersection_tms(tm_a: Any, tm_b: Any) -> Tuple[bool, Optional[Any]]:
+    if not TRIMESH_OK or tm_a is None or tm_b is None:
+        return False, None
+    succeeded = False
+    for engine in ("manifold", None):
+        try:
+            inter_raw = trimesh.boolean.intersection([tm_a, tm_b], engine=engine)  # type: ignore[attr-defined]
+            succeeded = True
+            inter_tm = _collapse_trimesh_result(inter_raw)
+            if inter_tm is not None and len(getattr(inter_tm, "faces", [])) > 0:
+                return True, inter_tm
+            # empty intersection
+            return True, trimesh.Trimesh(vertices=np.zeros((0, 3)), faces=np.zeros((0, 3), dtype=np.int64), process=False)  # type: ignore[attr-defined]
+        except Exception:
+            continue
+    return (True, trimesh.Trimesh(vertices=np.zeros((0, 3)), faces=np.zeros((0, 3), dtype=np.int64), process=False)) if succeeded else (False, None)  # type: ignore[attr-defined]
+
+
+def _trimesh_boolean_intersection(a: o3d.geometry.TriangleMesh, b: o3d.geometry.TriangleMesh) -> Optional[Any]:
+    if not TRIMESH_OK:
+        return None
+    tm_a = _o3d_to_trimesh_cached(a)
+    tm_b = _o3d_to_trimesh_cached(b)
+    if tm_a is None or tm_b is None:
+        return None
+
+    ok, inter_tm = _trimesh_boolean_intersection_tms(tm_a, tm_b)
+    if ok:
+        return inter_tm
+    if not _MESH_BOOL_LOG_STATE["trimesh_boolean_failed"]:
+        log_step("  Trimesh boolean intersection failed; falling back to raycast IoU where needed.")
+        _MESH_BOOL_LOG_STATE["trimesh_boolean_failed"] = True
+    return None
+
+
+def _trimesh_boolean_union(meshes: List[o3d.geometry.TriangleMesh]) -> Optional[Any]:
+    if not TRIMESH_OK:
+        return None
+    converted = []
+    for m in meshes or []:
+        tm = _o3d_to_trimesh_cached(m)
+        if tm is not None and len(getattr(tm, "faces", [])) > 0:
+            converted.append(tm)
+    if not converted:
+        return None
+    if len(converted) == 1:
+        return converted[0]
+
+    for engine in ("manifold", None):
+        try:
+            union_raw = trimesh.boolean.union(converted, engine=engine)  # type: ignore[attr-defined]
+            union_tm = _collapse_trimesh_result(union_raw)
+            if union_tm is not None and len(getattr(union_tm, "faces", [])) > 0:
+                return union_tm
+        except Exception:
+            continue
+
+    if not _MESH_BOOL_LOG_STATE["trimesh_boolean_failed"]:
+        log_step("  Trimesh boolean union failed; falling back to raycast IoU where needed.")
+        _MESH_BOOL_LOG_STATE["trimesh_boolean_failed"] = True
+    return None
+
+
+def _has_raycasting_scene() -> bool:
+    try:
+        return bool(getattr(o3d, "t", None) and getattr(o3d.t, "geometry", None) and hasattr(o3d.t.geometry, "RaycastingScene"))
+    except Exception:
+        return False
+
+
+def _raycast_scene_for_mesh(mesh: o3d.geometry.TriangleMesh) -> Optional[Any]:
+    if not _has_raycasting_scene():
+        if not _MESH_BOOL_LOG_STATE["raycast_missing"]:
+            log_step("  Open3D RaycastingScene unavailable; raycast IoU cannot be used.")
+            _MESH_BOOL_LOG_STATE["raycast_missing"] = True
+        return None
+    if mesh is None or len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
+        return None
+
+    key = id(mesh)
+    cached = _RAYCAST_SCENE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    try:
+        m = _o3d_mesh_copy(mesh)
+        _o3d_clean_mesh_for_volume(m)
+        try:
+            if m.is_orientable():
+                m.orient_triangles()
+        except Exception:
+            pass
+
+        try:
+            mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(m)
+        except Exception:
+            mesh_t = legacy_to_tensor_minimal(m)
+
+        scene = o3d.t.geometry.RaycastingScene()
+        _ = scene.add_triangles(mesh_t)
+        _RAYCAST_SCENE_CACHE[key] = scene
+        return scene
+    except Exception:
+        if not _MESH_BOOL_LOG_STATE["raycast_failed"]:
+            log_step("  RaycastingScene setup failed; raycast IoU will return 0 for affected pairs.")
+            _MESH_BOOL_LOG_STATE["raycast_failed"] = True
+        return None
+
+
+def _raycast_scene_for_meshes(meshes: List[o3d.geometry.TriangleMesh]) -> Optional[Any]:
+    """Build a temporary RaycastingScene containing all meshes (used for union-of-set)."""
+    if not _has_raycasting_scene():
+        if not _MESH_BOOL_LOG_STATE["raycast_missing"]:
+            log_step("  Open3D RaycastingScene unavailable; raycast IoU cannot be used.")
+            _MESH_BOOL_LOG_STATE["raycast_missing"] = True
+        return None
+    meshes = [m for m in (meshes or []) if m is not None and len(m.vertices) > 0 and len(m.triangles) > 0]
+    if not meshes:
+        return None
+    try:
+        scene = o3d.t.geometry.RaycastingScene()
+        for mesh in meshes:
+            m = _o3d_mesh_copy(mesh)
+            _o3d_clean_mesh_for_volume(m)
+            try:
+                if m.is_orientable():
+                    m.orient_triangles()
+            except Exception:
+                pass
+            try:
+                mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(m)
+            except Exception:
+                mesh_t = legacy_to_tensor_minimal(m)
+            _ = scene.add_triangles(mesh_t)
+        return scene
+    except Exception:
+        if not _MESH_BOOL_LOG_STATE["raycast_failed"]:
+            log_step("  RaycastingScene setup failed; raycast IoU will return 0 for affected pairs.")
+            _MESH_BOOL_LOG_STATE["raycast_failed"] = True
+        return None
+
+
+def _raycast_occupancy(scene: Any, points: np.ndarray) -> Optional[np.ndarray]:
+    if scene is None or points is None or points.size == 0:
+        return None
+    try:
+        pts = np.asarray(points, dtype=np.float32)
+        pts_t = o3d.core.Tensor(pts, dtype=o3d.core.Dtype.Float32)
+        occ_t = scene.compute_occupancy(pts_t)
+        try:
+            occ = occ_t.numpy()
+        except Exception:
+            occ = np.asarray(occ_t)
+        return np.asarray(occ).reshape(-1) > 0.5
+    except Exception:
+        return None
+
+
+def _adaptive_raycast_pitch(mins: np.ndarray, maxs: np.ndarray, pitch: float, max_voxels: int) -> float:
+    pitch = float(pitch)
+    if pitch <= 0:
+        pitch = 0.05
+    max_voxels = int(max_voxels) if max_voxels is not None else 0
+    if max_voxels <= 0:
+        return pitch
+    ext = np.maximum(np.asarray(maxs, dtype=float) - np.asarray(mins, dtype=float), 1e-9)
+    try:
+        # target ~max_voxels samples in the AABB
+        pitch_needed = float((float(ext[0] * ext[1] * ext[2]) / float(max_voxels)) ** (1.0 / 3.0))
+        if math.isfinite(pitch_needed) and pitch_needed > pitch:
+            return pitch_needed
+    except Exception:
+        pass
+    return pitch
+
+
+def _raycast_iou_between_scenes(scene_a: Any, scene_b: Any, aabb_min: np.ndarray, aabb_max: np.ndarray, eps: float) -> float:
+    if scene_a is None or scene_b is None:
+        return 0.0
+
+    pitch = _adaptive_raycast_pitch(aabb_min, aabb_max, IOU_RAYCAST_PITCH, IOU_RAYCAST_MAX_VOXELS)
+    pitch = float(pitch)
+    if pitch <= 0:
+        return 0.0
+
+    mins = np.asarray(aabb_min, dtype=float) - 0.5 * pitch
+    maxs = np.asarray(aabb_max, dtype=float) + 0.5 * pitch
+    ext = np.maximum(maxs - mins, 1e-9)
+    dims = np.maximum(np.ceil(ext / pitch).astype(np.int64), 1)
+    nx, ny, nz = int(dims[0]), int(dims[1]), int(dims[2])
+    total = nx * ny * nz
+    if total <= 0:
+        return 0.0
+
+    # voxel center coordinates per axis
+    xs = mins[0] + (np.arange(nx, dtype=np.float64) + 0.5) * pitch
+    ys = mins[1] + (np.arange(ny, dtype=np.float64) + 0.5) * pitch
+    zs = mins[2] + (np.arange(nz, dtype=np.float64) + 0.5) * pitch
+
+    inter_cnt = 0
+    union_cnt = 0
+    chunk = max(10_000, int(IOU_RAYCAST_CHUNK))
+    plane = nx * ny
+    for start in range(0, total, chunk):
+        end = min(total, start + chunk)
+        idx = np.arange(start, end, dtype=np.int64)
+        ix = idx % nx
+        iy = (idx // nx) % ny
+        iz = idx // plane
+        pts = np.column_stack([xs[ix], ys[iy], zs[iz]])
+
+        occ_a = _raycast_occupancy(scene_a, pts)
+        occ_b = _raycast_occupancy(scene_b, pts)
+        if occ_a is None or occ_b is None:
+            return 0.0
+        inter = occ_a & occ_b
+        union = occ_a | occ_b
+        inter_cnt += int(inter.sum())
+        union_cnt += int(union.sum())
+
+    if union_cnt <= 0:
+        return 0.0
+    return float(inter_cnt / union_cnt)
+
+
+def _o3d_boolean_intersection(a: o3d.geometry.TriangleMesh, b: o3d.geometry.TriangleMesh) -> Optional[o3d.geometry.TriangleMesh]:
+    """
+    Boolean intersection using trimesh (preferred). Returns None on failure.
+    """
+    if a is None or b is None or len(a.triangles) == 0 or len(b.triangles) == 0:
+        return None
+    if not TRIMESH_OK:
+        return None
+    inter_tm = _trimesh_boolean_intersection(a, b)
+    if inter_tm is None:
+        return None
+    try:
+        vertices = np.asarray(inter_tm.vertices, dtype=np.float64)
+        faces = np.asarray(inter_tm.faces, dtype=np.int64)
+        if vertices.size == 0 or faces.size == 0:
+            return None
+        out = o3d.geometry.TriangleMesh(
+            vertices=o3d.utility.Vector3dVector(vertices),
+            triangles=o3d.utility.Vector3iVector(faces.astype(np.int32, copy=False))
+        )
+        return out if len(out.triangles) > 0 else None
+    except Exception:
+        return None
+
+
+def _o3d_boolean_union(meshes: List[o3d.geometry.TriangleMesh]) -> Optional[o3d.geometry.TriangleMesh]:
+    """
+    Boolean union using trimesh (preferred). Returns None on failure.
+    """
+    meshes = [m for m in (meshes or []) if m is not None and len(m.triangles) > 0 and len(m.vertices) > 0]
+    if not meshes:
+        return None
+    if len(meshes) == 1:
+        return _o3d_mesh_copy(meshes[0])
+    if not TRIMESH_OK:
+        return None
+
+    union_tm = _trimesh_boolean_union(meshes)
+    if union_tm is None:
+        return None
+    try:
+        vertices = np.asarray(union_tm.vertices, dtype=np.float64)
+        faces = np.asarray(union_tm.faces, dtype=np.int64)
+        if vertices.size == 0 or faces.size == 0:
+            return None
+        out = o3d.geometry.TriangleMesh(
+            vertices=o3d.utility.Vector3dVector(vertices),
+            triangles=o3d.utility.Vector3iVector(faces.astype(np.int32, copy=False))
+        )
+        return out if len(out.triangles) > 0 else None
+    except Exception:
+        return None
+
+
+def intersection_volume_meshes(a: o3d.geometry.TriangleMesh, b: o3d.geometry.TriangleMesh) -> float:
+    inter = _o3d_boolean_intersection(a, b)
+    if inter is None:
+        return 0.0
+    return mesh_volume(inter)
+
+
+def union_volume_meshes(a: o3d.geometry.TriangleMesh, b: o3d.geometry.TriangleMesh) -> float:
+    u = _o3d_boolean_union([a, b])
+    if u is not None:
+        return mesh_volume(u)
+    # Fallback: volume(A) + volume(B) - volume(intersection)
+    va = mesh_volume(a)
+    vb = mesh_volume(b)
+    inter = intersection_volume_meshes(a, b)
+    return max(0.0, float(va + vb - inter))
+
+
+def iou_between_two_meshes(a: o3d.geometry.TriangleMesh, b: o3d.geometry.TriangleMesh, eps: float = 1e-7) -> float:
+    """
+    Mesh IoU using a robust backend:
+      - auto/trimesh: boolean intersection via trimesh (prefer manifold), union via volume identity
+      - raycast: occupancy integration via Open3D RaycastingScene (no booleans)
+    """
+    if a is None or b is None or len(a.triangles) == 0 or len(b.triangles) == 0:
+        return 0.0
+    try:
+        a_min, a_max = _o3d_bounds(a)
+        b_min, b_max = _o3d_bounds(b)
+        if not _aabb_overlap(a_min, a_max, b_min, b_max):
+            return 0.0
+    except Exception:
+        pass
+
+    backend = (IOU_BACKEND or "auto").strip().lower()
+    if backend not in {"auto", "trimesh", "raycast"}:
+        backend = "auto"
+
+    # ---- trimesh boolean backend ----
+    if backend in {"auto", "trimesh"} and TRIMESH_OK:
+        inter_tm = _trimesh_boolean_intersection(a, b)
+        if inter_tm is not None:
+            faces = getattr(inter_tm, "faces", None)
+            if faces is None or len(faces) == 0:
+                return 0.0
+
+            inter = _trimesh_volume(inter_tm)
+            if inter <= eps:
+                return 0.0
+
+            va = mesh_volume(a)
+            vb = mesh_volume(b)
+            if va <= eps or vb <= eps:
+                return 0.0
+            union = max(0.0, float(va + vb - inter))
+            return float(inter / union) if union > eps else 0.0
+
+        if backend == "trimesh":
+            return 0.0
+
+    # ---- raycast fallback ----
+    scene_a = _raycast_scene_for_mesh(a)
+    scene_b = _raycast_scene_for_mesh(b)
+    try:
+        a_min, a_max = _o3d_bounds(a)
+        b_min, b_max = _o3d_bounds(b)
+        mins = np.minimum(a_min, b_min)
+        maxs = np.maximum(a_max, b_max)
+    except Exception:
+        mins = np.zeros(3, dtype=float)
+        maxs = np.ones(3, dtype=float)
+    return _raycast_iou_between_scenes(scene_a, scene_b, mins, maxs, eps=eps)
+
+
+def iou_union_of_set_vs_single(
+    set_meshes: List[o3d.geometry.TriangleMesh],
+    ref_mesh: o3d.geometry.TriangleMesh,
+    eps: float = 1e-7,
+    max_k_for_ie: int = 8
+) -> float:
+    """
+    IoU( union(set_meshes), ref_mesh ).
+
+    For performance, max_k_for_ie is treated as a cap on how many meshes to union.
+    Backend selection matches iou_between_two_meshes().
+    """
+    meshes = [m for m in (set_meshes or []) if m is not None and len(m.triangles) > 0 and len(m.vertices) > 0]
+    if not meshes or ref_mesh is None or len(ref_mesh.triangles) == 0:
+        return 0.0
+    if max_k_for_ie is not None and max_k_for_ie > 0 and len(meshes) > max_k_for_ie:
+        meshes = meshes[:max_k_for_ie]
+
+    backend = (IOU_BACKEND or "auto").strip().lower()
+    if backend not in {"auto", "trimesh", "raycast"}:
+        backend = "auto"
+
+    # ---- trimesh boolean backend ----
+    if backend in {"auto", "trimesh"} and TRIMESH_OK:
+        union_tm = _trimesh_boolean_union(meshes)
+        if union_tm is not None and len(getattr(union_tm, "faces", [])) > 0:
+            tm_ref = _o3d_to_trimesh_cached(ref_mesh)
+            if tm_ref is not None and len(getattr(tm_ref, "faces", [])) > 0:
+                ok, inter_tm = _trimesh_boolean_intersection_tms(union_tm, tm_ref)
+                if ok and inter_tm is not None:
+                    if len(getattr(inter_tm, "faces", [])) == 0:
+                        return 0.0
+                    inter = _trimesh_volume(inter_tm)
+                    if inter <= eps:
+                        return 0.0
+                    v_union = _trimesh_volume(union_tm)
+                    v_ref = mesh_volume(ref_mesh)
+                    den = max(0.0, float(v_union + v_ref - inter))
+                    return float(inter / den) if den > eps else 0.0
+
+        if backend == "trimesh":
+            return 0.0
+
+    # ---- raycast fallback ----
+    scene_union = _raycast_scene_for_meshes(meshes)
+    scene_ref = _raycast_scene_for_mesh(ref_mesh)
+    try:
+        bounds = [_o3d_bounds(ref_mesh)] + [_o3d_bounds(m) for m in meshes]
+        mins = np.min(np.stack([b[0] for b in bounds], axis=0), axis=0)
+        maxs = np.max(np.stack([b[1] for b in bounds], axis=0), axis=0)
+    except Exception:
+        mins = np.zeros(3, dtype=float)
+        maxs = np.ones(3, dtype=float)
+    return _raycast_iou_between_scenes(scene_union, scene_ref, mins, maxs, eps=eps)
 
 
 # ---------- IFC -> mesh & metadata ----------
@@ -1423,7 +2043,7 @@ def compute_space_iou_matrix(
     above_thresh: List[Tuple[int, int, float]] = []
     for i, g in enumerate(spaces_gt):
         for j, p in enumerate(spaces_pr):
-            v = iou_between_two_obbs(g.obb, p.obb, eps=inside_eps)
+            v = iou_between_two_meshes(g.mesh, p.mesh, eps=inside_eps)
             S[i, j] = v
             if v >= thresh:
                 above_thresh.append((i, j, float(v)))
@@ -1479,6 +2099,7 @@ def apply_transform_to_indices(comps: List[Comp], indices: List[int], T: np.ndar
         comp.aabb_min, comp.aabb_max = _o3d_bounds(comp.mesh)
         comp.obb = _transform_obb(comp.obb, T)
         comp.volume = _obb_volume(comp.obb)
+    _clear_mesh_iou_caches()
 
 
 def _matrix_to_nested_list(T: np.ndarray) -> List[List[float]]:
@@ -1559,7 +2180,7 @@ def _run_round(
         matched_gt_space_indices.add(i_gt)
         matched_pr_space_indices.add(j_pr)
 
-        pre_iou = iou_between_two_obbs(gt_space.obb, pr_space.obb, eps=inside_eps)
+        pre_iou = iou_between_two_meshes(gt_space.mesh, pr_space.mesh, eps=inside_eps)
 
         log_step(f"[{round_label}] Pair {match_idx + 1}/{len(matches)} GT {gt_guid} <-> PRED {pr_guid} (IoU={pre_iou:.3f})")
         if apply_local_alignment:
@@ -1607,7 +2228,7 @@ def _run_round(
             pr_space=spaces_pr[j_pr]
         )
 
-        post_iou = iou_between_two_obbs(gt_space.obb, spaces_pr[j_pr].obb, eps=inside_eps)
+        post_iou = iou_between_two_meshes(gt_space.mesh, spaces_pr[j_pr].mesh, eps=inside_eps)
         gt_floor_area = _mesh_floor_area_xy(gt_space.mesh)
         pred_floor_area = _mesh_floor_area_xy(spaces_pr[j_pr].mesh)
         gt_dim_x, gt_dim_y, gt_dim_z = _space_xyz_dimensions(gt_space)
@@ -1928,9 +2549,10 @@ def _o3d_transform_inplace(comps: List[Comp], T: np.ndarray) -> None:
         c.aabb_min, c.aabb_max = _o3d_bounds(c.mesh)
         c.obb = _transform_obb(c.obb, T)
         c.volume = _obb_volume(c.obb)
+    _clear_mesh_iou_caches()
 
 
-# ---------- IoU + Compactness (OBB-based) ----------
+# ---------- IoU + Compactness (mesh-boolean) ----------
 
 def _aabb_overlap(a_min, a_max, b_min, b_max) -> bool:
     return np.all(a_min <= b_max) and np.all(b_min <= a_max) and np.all(a_max >= b_min) and np.all(b_max >= a_min)
@@ -1955,7 +2577,7 @@ def _ifc_types_compatible_for_matching(gt_ifc_type: str, pred_ifc_type: str) -> 
 
 def _pairwise_iou(gt: List[Comp], pr: List[Comp], eps: float, inside_eps: float = 1e-7) -> np.ndarray:
     m, n = len(gt), len(pr)
-    log_step(f"Computing pairwise IoU matrix ({m}x{n}) using OBB intersection/union")
+    log_step(f"Computing pairwise IoU matrix ({m}x{n}) using mesh boolean volumes")
     M = np.zeros((m, n), dtype=float)
     progress_stride = max(1, min(50, (m // 10) or 5))
     for i, g in enumerate(gt):
@@ -1964,7 +2586,7 @@ def _pairwise_iou(gt: List[Comp], pr: List[Comp], eps: float, inside_eps: float 
                 continue
             if not _aabb_overlap(g.aabb_min, g.aabb_max, p.aabb_min, p.aabb_max):
                 continue
-            v = iou_between_two_obbs(g.obb, p.obb, eps=inside_eps)
+            v = iou_between_two_meshes(g.mesh, p.mesh, eps=inside_eps)
             M[i, j] = v if v >= eps else 0.0
         if VERBOSE and (m > 0) and (((i + 1) % progress_stride == 0) or (i == m - 1)):
             log_step(f"  IoU progress: processed {i + 1}/{m} GT elements")
@@ -1981,7 +2603,7 @@ def compute_all_metrics(
     inside_eps: float = 1e-7,
     max_k_for_ie: int = 8
 ) -> Dict[str, Any]:
-    log_step("Aggregating IoU and compactness metrics (OBB-based)")
+    log_step("Aggregating IoU and compactness metrics (mesh-boolean)")
     M = _pairwise_iou(gt, pr, eps=eps, inside_eps=inside_eps)
     m, n = M.shape
 
@@ -2000,7 +2622,13 @@ def compute_all_metrics(
         for entry, j in zip(pairwise, js):
             entry["pred_global_index"] = pr[j].idx
         if js:
-            iou_union = iou_union_of_set_vs_single([pr[j].obb for j in js], g.obb, eps=inside_eps, max_k_for_ie=max_k_for_ie)
+            js_for_union = sorted(js, key=lambda j: float(M[i, j]), reverse=True)
+            iou_union = iou_union_of_set_vs_single(
+                [pr[j].mesh for j in js_for_union],
+                g.mesh,
+                eps=inside_eps,
+                max_k_for_ie=max_k_for_ie
+            )
         else:
             iou_union = 0.0
         gt_ious.append(iou_union)
@@ -2044,7 +2672,13 @@ def compute_all_metrics(
         for entry, i in zip(pairwise, is_):
             entry["gt_global_index"] = gt[i].idx
         if is_:
-            iou_union = iou_union_of_set_vs_single([gt[i].obb for i in is_], p.obb, eps=inside_eps, max_k_for_ie=max_k_for_ie)
+            is_for_union = sorted(is_, key=lambda i: float(M[i, j]), reverse=True)
+            iou_union = iou_union_of_set_vs_single(
+                [gt[i].mesh for i in is_for_union],
+                p.mesh,
+                eps=inside_eps,
+                max_k_for_ie=max_k_for_ie
+            )
         else:
             iou_union = 0.0
         pr_ious.append(iou_union)
@@ -2403,7 +3037,7 @@ def _visualize_spaces(spaces_gt: List[Comp], spaces_pr: List[Comp], title: str =
 def main():
     _silence_vtk_output()
 
-    ap = argparse.ArgumentParser(description="Per-element 3D-IoU & 3D-Compactness between two IFCs, with metadata. (OBB-only)")
+    ap = argparse.ArgumentParser(description="Per-element 3D-IoU & 3D-Compactness between two IFCs, with metadata. (mesh booleans)")
     ap.add_argument("--gt", required=True, help="Path to ground-truth IFC.")
     ap.add_argument("--pred", required=True, help="Path to predicted/reconstructed IFC.")
     ap.add_argument("--target-space-guid", "--align-space-guid", required=False, default=None,
@@ -2428,8 +3062,20 @@ def main():
                     help="Optional list of IFC classes to include (e.g. IfcWall IfcDoor). You may also pass a single comma-separated string 'IfcWall,IfcDoor'.")
     ap.add_argument("--include-unmatched", choices=["ignore", "global"], default="ignore",
                     help="Handling for elements in unmatched spaces. 'ignore' skips them; 'global' aggregates them in a single unmatched bucket.")
-    ap.add_argument("--inside-eps", type=float, default=1e-7, help="Tolerance for half-space tests / plane membership.")
-    ap.add_argument("--ie-cap", type=int, default=8, help="Max K for exact inclusion-exclusion before pairwise approximation.")
+    ap.add_argument("--inside-eps", type=float, default=1e-7,
+                    help="Numerical epsilon for mesh IoU volumes (treat volumes <= eps as empty).")
+    ap.add_argument("--ie-cap", type=int, default=8,
+                    help="Max number of meshes to union for many-to-one IoU aggregation (runtime cap).")
+    ap.add_argument("--iou-backend", choices=["auto", "trimesh", "raycast"], default="auto",
+                    help="IoU backend: 'trimesh' uses robust mesh booleans (recommended), "
+                         "'raycast' uses occupancy integration (no booleans), "
+                         "'auto' tries trimesh then falls back to raycast.")
+    ap.add_argument("--raycast-pitch", type=float, default=0.05,
+                    help="Base voxel pitch (meters) for the raycast IoU backend (may be increased to respect --raycast-max-voxels).")
+    ap.add_argument("--raycast-max-voxels", type=int, default=2_000_000,
+                    help="Maximum occupancy samples per IoU evaluation for the raycast backend.")
+    ap.add_argument("--raycast-chunk", type=int, default=250_000,
+                    help="Chunk size for occupancy queries in the raycast backend.")
 
     # PAPER MODELS
 
@@ -2479,8 +3125,8 @@ def main():
         "--space-align", "none",
         "--space-match-thresh", "0.25",
         "--epsilon", "0.10",
-        "--save-json", "metrics_obb.json",
-        "--save-csv-prefix", "out/metrics_obb",
+        "--save-json", "metrics_mesh.json",
+        "--save-csv-prefix", "out/metrics_mesh",
         "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace", "IfcDoor", "IfcWindow",
         "--include-unmatched", "ignore",
     ]
@@ -2549,6 +3195,19 @@ def main():
     if args.ifc_classes is not None and len(args.ifc_classes) == 1 and ',' in args.ifc_classes[0]:
         args.ifc_classes = [s.strip() for s in args.ifc_classes[0].split(',') if s.strip()]
 
+    # Configure IoU backend globals (used by iou_between_two_meshes / iou_union_of_set_vs_single).
+    global IOU_BACKEND, IOU_RAYCAST_PITCH, IOU_RAYCAST_MAX_VOXELS, IOU_RAYCAST_CHUNK
+    IOU_BACKEND = str(getattr(args, "iou_backend", "auto")).strip().lower() or "auto"
+    IOU_RAYCAST_PITCH = float(getattr(args, "raycast_pitch", IOU_RAYCAST_PITCH))
+    IOU_RAYCAST_MAX_VOXELS = int(getattr(args, "raycast_max_voxels", IOU_RAYCAST_MAX_VOXELS))
+    IOU_RAYCAST_CHUNK = int(getattr(args, "raycast_chunk", IOU_RAYCAST_CHUNK))
+    if IOU_BACKEND == "trimesh" and not TRIMESH_OK:
+        log_step("IoU backend 'trimesh' requested but trimesh is not installed; switching to 'raycast'.")
+        IOU_BACKEND = "raycast"
+    elif IOU_BACKEND in {"auto", "trimesh"} and not TRIMESH_OK:
+        log_step("Trimesh not installed; IoU backend will use raycast fallback.")
+    _clear_mesh_iou_caches()
+
     args.target_space_guid = (args.target_space_guid or "").strip() or None
     target_guid_provided = args.target_space_guid is not None
     align_lower = args.align.lower()
@@ -2584,7 +3243,7 @@ def main():
     if elems_gt and gt_elements_without_space == len(elems_gt) and args.include_unmatched == "ignore":
         log_step(
             "WARNING: 100% of GT elements have no associated IfcSpace; with --include-unmatched ignore, "
-            "`metrics_obb_*_per_gt.csv` will be empty. Use --include-unmatched global or provide an IFC "
+            "`metrics_*_per_gt.csv` will be empty. Use --include-unmatched global or provide an IFC "
             "with element-to-space relationships."
         )
 
@@ -2682,9 +3341,9 @@ def main():
         _o3d_transform_inplace(elems_pr, target_icp_alignment)
         global_alignment = target_icp_alignment @ global_alignment
         global_alignment_mode = "centroid_then_target_icp"
-        target_post_iou = iou_between_two_obbs(
-            target_gt_space.obb,
-            spaces_pr[target_pr_idx].obb,
+        target_post_iou = iou_between_two_meshes(
+            target_gt_space.mesh,
+            spaces_pr[target_pr_idx].mesh,
             eps=inside_eps
         )
         log_step(f"  Target space IoU (before ICP): {float(target_pre_iou):.6f} | after ICP: {float(target_post_iou):.6f}")
