@@ -314,6 +314,17 @@ def _xyz_dimensions(comp: Comp) -> Tuple[float, float, float]:
     return float(ext2[0]), float(ext2[1]), float(ext2[2])
 
 
+def _area_from_dims(dim_x: Any, dim_y: Any, dim_z: Any) -> float:
+    """Compute an approximate surface area using the two largest dimensions."""
+    dims = [
+        abs(_safe_float(dim_x, default=0.0)),
+        abs(_safe_float(dim_y, default=0.0)),
+        abs(_safe_float(dim_z, default=0.0))
+    ]
+    dims.sort(reverse=True)
+    return float(dims[0] * dims[1])
+
+
 def _space_xyz_dimensions(comp: Comp) -> Tuple[float, float, float]:
     return _xyz_dimensions(comp)
 
@@ -1839,6 +1850,177 @@ def _compute_round_element_metrics(
         row["space_guids"] = guids
         row["spaces"] = [{"guid": guid, "name": pred_space_guid_to_name.get(guid)} for guid in guids]
 
+    # Include IfcSpace results in the per-element CSV exports.
+    # - IoU uses the space matching IoU (post-alignment for this round) when available.
+    # - Area uses the previously gathered floor area (XY-projected) when available; otherwise it's computed.
+    space_match_records = round_eval.get("space_match_records") or []
+    floor_area_records = round_eval.get("floor_area_records") or []
+    if spaces_gt or spaces_pr:
+        gt_offset = len(global_metrics.get("per_gt", []))
+        pred_offset = len(global_metrics.get("per_pred", []))
+
+        gt_to_pred_space_idx: Dict[int, int] = {}
+        pred_to_gt_space_idx: Dict[int, int] = {}
+        space_iou_by_gt_idx: Dict[int, float] = {}
+        space_iou_by_pred_idx: Dict[int, float] = {}
+        for rec in space_match_records:
+            gt_idx = rec.get("gt_index")
+            pred_idx = rec.get("pred_index")
+            if gt_idx is None or pred_idx is None:
+                continue
+            gt_i = int(gt_idx)
+            pr_j = int(pred_idx)
+            if not (0 <= gt_i < len(spaces_gt)) or not (0 <= pr_j < len(spaces_pr)):
+                continue
+            gt_to_pred_space_idx[gt_i] = pr_j
+            pred_to_gt_space_idx[pr_j] = gt_i
+            iou_val = _safe_float(rec.get("space_iou", 0.0), default=0.0)
+            space_iou_by_gt_idx[gt_i] = iou_val
+            space_iou_by_pred_idx[pr_j] = iou_val
+
+        gt_dims_by_guid: Dict[str, Tuple[float, float, float]] = {}
+        pred_dims_by_guid: Dict[str, Tuple[float, float, float]] = {}
+        gt_floor_area_by_guid: Dict[str, float] = {}
+        pred_floor_area_by_guid: Dict[str, float] = {}
+        for rec in floor_area_records:
+            gt_guid = rec.get("gt_guid")
+            pred_guid = rec.get("pred_guid")
+            if not gt_guid or not pred_guid:
+                continue
+            gt_guid_str = str(gt_guid)
+            pred_guid_str = str(pred_guid)
+            gt_dims_by_guid[gt_guid_str] = (
+                _safe_float(rec.get("gt_dim_x", 0.0), default=0.0),
+                _safe_float(rec.get("gt_dim_y", 0.0), default=0.0),
+                _safe_float(rec.get("gt_dim_z", 0.0), default=0.0)
+            )
+            pred_dims_by_guid[pred_guid_str] = (
+                _safe_float(rec.get("pred_dim_x", 0.0), default=0.0),
+                _safe_float(rec.get("pred_dim_y", 0.0), default=0.0),
+                _safe_float(rec.get("pred_dim_z", 0.0), default=0.0)
+            )
+            gt_floor_area_by_guid[gt_guid_str] = _safe_float(rec.get("gt_floor_area", 0.0), default=0.0)
+            pred_floor_area_by_guid[pred_guid_str] = _safe_float(rec.get("pred_floor_area", 0.0), default=0.0)
+
+        # GT space rows
+        for gt_space_idx, gt_space in enumerate(spaces_gt):
+            gt_guid = gt_space.guid or f"<gt-space-{gt_space_idx}>"
+            gt_guid_str = str(gt_guid)
+            gt_index = gt_offset + gt_space_idx
+
+            pred_space_idx = gt_to_pred_space_idx.get(gt_space_idx)
+            if pred_space_idx is not None and 0 <= pred_space_idx < len(spaces_pr):
+                pred_space = spaces_pr[pred_space_idx]
+                pred_guid_str = str(pred_space.guid or f"<pred-space-{pred_space_idx}>")
+                pred_index = pred_offset + pred_space_idx
+                space_iou = float(space_iou_by_gt_idx.get(gt_space_idx, 0.0))
+                matches_pred_indices = [pred_index]
+                matches_pred_guids = [pred_guid_str]
+                pairwise_pred = [{"pred_index": pred_index, "pred_guid": pred_guid_str, "iou": space_iou}]
+                local_compact = 1.0
+            else:
+                pred_guid_str = None
+                pred_index = None
+                space_iou = 0.0
+                matches_pred_indices = []
+                matches_pred_guids = []
+                pairwise_pred = []
+                local_compact = 0.0
+
+            if gt_guid_str in gt_dims_by_guid:
+                gt_dim_x, gt_dim_y, gt_dim_z = gt_dims_by_guid[gt_guid_str]
+            else:
+                gt_dim_x, gt_dim_y, gt_dim_z = _space_xyz_dimensions(gt_space)
+            gt_area = gt_floor_area_by_guid.get(gt_guid_str)
+            if gt_area is None:
+                gt_area = _mesh_floor_area_xy(gt_space.mesh)
+
+            global_metrics["per_gt"].append({
+                "gt_index": gt_index,
+                "gt_guid": gt_guid_str,
+                "gt_ifc_type": "IfcSpace",
+                "gt_dim_x": float(gt_dim_x),
+                "gt_dim_y": float(gt_dim_y),
+                "gt_dim_z": float(gt_dim_z),
+                "gt_area": float(gt_area),
+                "gt_meta": asdict(gt_space.meta),
+                "gt_wall_thickness": None,
+                "avg_matched_pred_wall_thickness": None,
+                "matches_pred_indices": matches_pred_indices,
+                "matches_pred_guids": matches_pred_guids,
+                "pairwise_pred": pairwise_pred,
+                "iou_union_pred_vs_gt": float(space_iou),
+                "local_compactness_gt_to_pred": float(local_compact),
+                "gt_global_index": gt_space.idx
+            })
+
+        # PRED space rows
+        for pred_space_idx, pred_space in enumerate(spaces_pr):
+            pred_guid = pred_space.guid or f"<pred-space-{pred_space_idx}>"
+            pred_guid_str = str(pred_guid)
+            pred_index = pred_offset + pred_space_idx
+
+            gt_space_idx = pred_to_gt_space_idx.get(pred_space_idx)
+            if gt_space_idx is not None and 0 <= gt_space_idx < len(spaces_gt):
+                gt_space = spaces_gt[gt_space_idx]
+                gt_guid_str = str(gt_space.guid or f"<gt-space-{gt_space_idx}>")
+                gt_index = gt_offset + gt_space_idx
+                space_iou = float(space_iou_by_pred_idx.get(pred_space_idx, 0.0))
+                matches_gt_indices = [gt_index]
+                matches_gt_guids = [gt_guid_str]
+                pairwise_gt = [{"gt_index": gt_index, "gt_guid": gt_guid_str, "iou": space_iou}]
+                local_compact = 1.0
+            else:
+                gt_guid_str = None
+                gt_index = None
+                space_iou = 0.0
+                matches_gt_indices = []
+                matches_gt_guids = []
+                pairwise_gt = []
+                local_compact = 0.0
+
+            if pred_guid_str in pred_dims_by_guid:
+                pred_dim_x, pred_dim_y, pred_dim_z = pred_dims_by_guid[pred_guid_str]
+            else:
+                pred_dim_x, pred_dim_y, pred_dim_z = _space_xyz_dimensions(pred_space)
+            pred_area = pred_floor_area_by_guid.get(pred_guid_str)
+            if pred_area is None:
+                pred_area = _mesh_floor_area_xy(pred_space.mesh)
+
+            global_metrics["per_pred"].append({
+                "pred_index": pred_index,
+                "pred_guid": pred_guid_str,
+                "pred_ifc_type": "IfcSpace",
+                "pred_dim_x": float(pred_dim_x),
+                "pred_dim_y": float(pred_dim_y),
+                "pred_dim_z": float(pred_dim_z),
+                "pred_area": float(pred_area),
+                "pred_meta": asdict(pred_space.meta),
+                "pred_wall_thickness": None,
+                "matches_gt_indices": matches_gt_indices,
+                "matches_gt_guids": matches_gt_guids,
+                "pairwise_gt": pairwise_gt,
+                "iou_union_gt_vs_pred": float(space_iou),
+                "local_compactness_pred_to_gt": float(local_compact),
+                "pred_global_index": pred_space.idx
+            })
+
+        # Space correspondences (one edge per matched pair)
+        for gt_space_idx, pred_space_idx in gt_to_pred_space_idx.items():
+            if not (0 <= gt_space_idx < len(spaces_gt)) or not (0 <= pred_space_idx < len(spaces_pr)):
+                continue
+            gt_space = spaces_gt[gt_space_idx]
+            pred_space = spaces_pr[pred_space_idx]
+            global_metrics["correspondences"].append({
+                "gt_index": gt_offset + gt_space_idx,
+                "gt_guid": str(gt_space.guid or f"<gt-space-{gt_space_idx}>"),
+                "pred_index": pred_offset + pred_space_idx,
+                "pred_guid": str(pred_space.guid or f"<pred-space-{pred_space_idx}>"),
+                "iou": float(space_iou_by_gt_idx.get(gt_space_idx, 0.0)),
+                "gt_global_index": gt_space.idx,
+                "pred_global_index": pred_space.idx
+            })
+
     unmatched_summary = {
         "mode": include_unmatched_mode,
         "gt_spaces_unmatched": len(unmatched_gt_space_indices),
@@ -1992,6 +2174,7 @@ def compute_all_metrics(
     log_step("  Computing per-GT aggregates")
     for i, g in enumerate(gt):
         gt_dim_x, gt_dim_y, gt_dim_z = _xyz_dimensions(g)
+        gt_area = _mesh_floor_area_xy(g.mesh) if (g.etype or "").lower() == "ifcspace" else _area_from_dims(gt_dim_x, gt_dim_y, gt_dim_z)
         js = [j for j in range(n) if M[i, j] > 0.0]
         local_compact = (1.0 / len(js)) if js else 0.0
         gt_local_compact.append(local_compact)
@@ -2018,6 +2201,7 @@ def compute_all_metrics(
             "gt_dim_x": gt_dim_x,
             "gt_dim_y": gt_dim_y,
             "gt_dim_z": gt_dim_z,
+            "gt_area": gt_area,
             "gt_meta": asdict(g.meta),
             "gt_wall_thickness": float(g.wall_thickness) if g.wall_thickness is not None else None,
             "avg_matched_pred_wall_thickness": avg_match_pred_wall,
@@ -2036,6 +2220,7 @@ def compute_all_metrics(
     log_step("  Computing per-PRED aggregates")
     for j, p in enumerate(pr):
         pred_dim_x, pred_dim_y, pred_dim_z = _xyz_dimensions(p)
+        pred_area = _mesh_floor_area_xy(p.mesh) if (p.etype or "").lower() == "ifcspace" else _area_from_dims(pred_dim_x, pred_dim_y, pred_dim_z)
         is_ = [i for i in range(m) if M[i, j] > 0.0]
         local_compact = (1.0 / len(is_)) if is_ else 0.0
         pr_local_compact.append(local_compact)
@@ -2056,6 +2241,7 @@ def compute_all_metrics(
             "pred_dim_x": pred_dim_x,
             "pred_dim_y": pred_dim_y,
             "pred_dim_z": pred_dim_z,
+            "pred_area": pred_area,
             "pred_meta": asdict(p.meta),
             "pred_wall_thickness": float(p.wall_thickness) if p.wall_thickness is not None else None,
             "matches_gt_indices": is_,
@@ -2111,7 +2297,7 @@ def _write_csv_bundle(prefix: str, per_gt: List[Dict[str, Any]], per_pred: List[
         w.writerow([
             "gt_index","gt_guid","gt_ifc_type","iou_union_pred_vs_gt",
             "local_compactness_gt_to_pred","gt_wall_thickness","avg_matched_pred_wall_thickness","num_matches","match_pred_guids",
-            "gt_dim_x","gt_dim_y","gt_dim_z"
+            "gt_dim_x","gt_dim_y","gt_dim_z","gt_area"
         ])
         for r in per_gt:
             thickness = r.get("gt_wall_thickness")
@@ -2119,6 +2305,7 @@ def _write_csv_bundle(prefix: str, per_gt: List[Dict[str, Any]], per_pred: List[
             dim_x = r.get("gt_dim_x")
             dim_y = r.get("gt_dim_y")
             dim_z = r.get("gt_dim_z")
+            area = r.get("gt_area")
             w.writerow([
                 r.get("gt_index"),
                 r.get("gt_guid"),
@@ -2131,7 +2318,8 @@ def _write_csv_bundle(prefix: str, per_gt: List[Dict[str, Any]], per_pred: List[
                 ";".join(r.get("matches_pred_guids", [])),
                 "" if dim_x in (None, "") else f'{float(dim_x):.6f}',
                 "" if dim_y in (None, "") else f'{float(dim_y):.6f}',
-                "" if dim_z in (None, "") else f'{float(dim_z):.6f}'
+                "" if dim_z in (None, "") else f'{float(dim_z):.6f}',
+                "" if area in (None, "") else f'{float(area):.6f}'
             ])
 
     with open(f"{prefix}_per_pred.csv", "w", newline="", encoding="utf-8") as f:
@@ -2139,13 +2327,14 @@ def _write_csv_bundle(prefix: str, per_gt: List[Dict[str, Any]], per_pred: List[
         w.writerow([
             "pred_index","pred_guid","pred_ifc_type","iou_union_gt_vs_pred",
             "local_compactness_pred_to_gt","pred_wall_thickness","num_matches","match_gt_guids",
-            "pred_dim_x","pred_dim_y","pred_dim_z"
+            "pred_dim_x","pred_dim_y","pred_dim_z","pred_area"
         ])
         for r in per_pred:
             thickness = r.get("pred_wall_thickness")
             dim_x = r.get("pred_dim_x")
             dim_y = r.get("pred_dim_y")
             dim_z = r.get("pred_dim_z")
+            area = r.get("pred_area")
             w.writerow([
                 r.get("pred_index"),
                 r.get("pred_guid"),
@@ -2157,7 +2346,8 @@ def _write_csv_bundle(prefix: str, per_gt: List[Dict[str, Any]], per_pred: List[
                 ";".join(r.get("matches_gt_guids", [])),
                 "" if dim_x in (None, "") else f'{float(dim_x):.6f}',
                 "" if dim_y in (None, "") else f'{float(dim_y):.6f}',
-                "" if dim_z in (None, "") else f'{float(dim_z):.6f}'
+                "" if dim_z in (None, "") else f'{float(dim_z):.6f}',
+                "" if area in (None, "") else f'{float(area):.6f}'
             ])
 
     with open(f"{prefix}_edges.csv", "w", newline="", encoding="utf-8") as f:
