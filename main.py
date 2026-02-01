@@ -666,7 +666,6 @@ def rigid_icp_align(pred_meshes: List[o3d.geometry.TriangleMesh], gt_meshes: Lis
         src, tgt, max_corr, np.eye(4),
         o3d.pipelines.registration.TransformationEstimationPointToPoint()
     )
-    print(reg.transformation)
     return reg.transformation @ T0
 
 
@@ -1191,27 +1190,7 @@ def main():
     ap.add_argument("--ifc-classes", nargs="+", default=None,
                     help="Optional list of IFC classes to include (e.g. IfcWall IfcDoor). You may also pass a single comma-separated string 'IfcWall,IfcDoor'.")
 
-    # Default CLI arguments for convenience (used only when no CLI args are provided)
-    DEFAULT_ARGS = [
-        "--gt", ".\\input\\WW_revit_model_v6.ifc",
-        "--pred", ".\\input\\ww-v1-ifc4-geo.ifc",
-        "--align", "icp",
-        "--backend", "exact",
-        "--voxel-size", "0.05",
-        "--epsilon", "0.1",
-        "--save-json", "metrics.json",
-        "--save-csv-prefix", "out/metrics",
-        "--ifc-classes", "IfcWall", "IfcWallStandardCase"
-        # "--ifc-classes", "IfcSpace"
-    ]
-
-    # If the script was invoked without extra CLI args, use DEFAULT_ARGS.
-    # Otherwise respect actual command-line arguments.
-    if len(sys.argv) == 1:
-        log_step(f"No CLI arguments detected — using DEFAULT_ARGS: {' '.join(DEFAULT_ARGS)}")
-        args = ap.parse_args(DEFAULT_ARGS)
-    else:
-        args = ap.parse_args()
+    args = ap.parse_args()
 
     # Normalize --ifc-classes: allow single token comma-separated input
     if args.ifc_classes is not None and len(args.ifc_classes) == 1 and ',' in args.ifc_classes[0]:
@@ -1225,10 +1204,7 @@ def main():
     pr, _ = load_ifc_components(args.pred, include_types=args.ifc_classes)
     log_step(f"  PRED elements loaded: {len(pr)}")
 
-    # # --- TESTING: Use only first 5 elements ---
-    # gt = gt[:20]
-    # pr = pr[:20]
-    # log_step(f"  Using first 5 GT and PRED elements for testing")
+
 
     # Visualize pre-alignment (Open3D)
     gt_meshes = [_o3d_mesh_copy(c.mesh) for c in gt]
