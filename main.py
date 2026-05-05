@@ -669,6 +669,57 @@ def rigid_icp_align(pred_meshes: List[o3d.geometry.TriangleMesh], gt_meshes: Lis
     return reg.transformation @ T0
 
 
+def rigid_icp_align_translation_only(pred_meshes: List[o3d.geometry.TriangleMesh], gt_meshes: List[o3d.geometry.TriangleMesh]) -> np.ndarray:
+    """
+    Align PRED -> GT using X/Y/Z translation only — no rotation around any axis.
+    Strategy: iterative translation-only ICP.
+      1. Pre-align centroids in 3D.
+      2. Each iteration: find nearest-neighbour correspondences via one ICP step,
+         compute the mean displacement vector (pure translation), apply it.
+      3. Repeat until the delta is negligible or max iterations reached.
+    """
+    T0 = _centroid_align(pred_meshes, gt_meshes)
+    src = _o3d_pcd_from_meshes(pred_meshes)
+    tgt = _o3d_pcd_from_meshes(gt_meshes)
+    src.transform(T0)
+
+    gt_all = _o3d_concat_meshes(gt_meshes)
+    gmin, gmax = _o3d_bounds(gt_all)
+    diag = float(np.linalg.norm(gmax - gmin))
+    max_corr = max(0.02 * diag, 0.05)
+
+    tgt_pts = np.asarray(tgt.points)
+    cum_t = np.zeros(3)
+
+    for _ in range(50):
+        # One ICP step (max_iteration=1) to get correspondences via C++ NN search
+        reg = o3d.pipelines.registration.registration_icp(
+            src, tgt, max_corr, np.eye(4),
+            o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=1),
+        )
+        corr = np.asarray(reg.correspondence_set)
+        if len(corr) == 0:
+            break
+
+        src_pts = np.asarray(src.points)
+        delta = (tgt_pts[corr[:, 1]] - src_pts[corr[:, 0]]).mean(axis=0)
+
+        T_delta = np.eye(4)
+        T_delta[:3, 3] = delta
+        src.transform(T_delta)
+        cum_t += delta
+
+        if np.linalg.norm(delta) < 1e-6:
+            break
+
+    T = np.eye(4)
+    T[:3, 3] = cum_t
+    print("Alignment (translation-only ICP, XYZ):")
+    print(T)
+    return T @ T0
+
+
 def rigid_icp_align_xy_only(pred_meshes: List[o3d.geometry.TriangleMesh], gt_meshes: List[o3d.geometry.TriangleMesh]) -> np.ndarray:
     """
     Align PRED -> GT using only an X/Y translation. No rotation is applied.
@@ -1206,28 +1257,13 @@ def main():
 
 
 
-    # Visualize pre-alignment (Open3D)
-    gt_meshes = [_o3d_mesh_copy(c.mesh) for c in gt]
-    pred_meshes = [_o3d_mesh_copy(c.mesh) for c in pr]
-    for m in gt_meshes:
-        m.paint_uniform_color([0, 1, 0])  # green
-    for m in pred_meshes:
-        m.paint_uniform_color([1, 0, 0])  # red
-    try:
-        o3d.visualization.draw_geometries(gt_meshes, mesh_show_wireframe=True)
-        o3d.visualization.draw_geometries(pred_meshes, mesh_show_wireframe=True)
-        o3d.visualization.draw_geometries(gt_meshes + pred_meshes, mesh_show_wireframe=True)
-    except Exception:
-        pass
-
     # Align PRED -> GT
     if args.align != "none":
         log_step("Aligning PRED to GT ...")
         if args.align == "icp":
             if OPEN3D_OK:
                 log_step("  Running Open3D ICP alignment")
-                # T = rigid_icp_align([c.mesh for c in pr], [c.mesh for c in gt])
-                T = rigid_icp_align_xy_only([c.mesh for c in pr], [c.mesh for c in gt])
+                T = rigid_icp_align_translation_only([c.mesh for c in pr], [c.mesh for c in gt])
             else:
                 log_step("  Open3D unavailable; using centroid alignment instead")
                 T = _centroid_align([c.mesh for c in pr], [c.mesh for c in gt])
