@@ -14,6 +14,7 @@ Compute per-element **3D-IoU** and **3D-Compactness** metrics between two IFC fi
   - `none`
 - Optional model-wide ICP refinement derived from a single target space (`--target-space-guid`)
 - Exact OBB intersection/union math with inclusion-exclusion for pairwise IoU
+- Footprint-based **2D IoU** for matched spaces: XY-projected footprints are rasterized onto a shared occupancy grid (handles non-convex rooms), reported as `space_iou_2d` / `iou2d_footprint` alongside the 3D IoU
 - Room-type extraction for spaces (`LongName` → `ObjectType` → `Pset_SpaceCommon`), reported as `gt_room_type` / `pred_room_type` in the outputs
 - Floor-area comparison CSV for matched spaces
 - Open3D visualization of GT (green) vs. PRED (red) before/after alignment, globally and per space
@@ -56,6 +57,7 @@ Running `python main.py` with no arguments uses the `DEFAULT_ARGS` block defined
 | `--visualize-per-space` | Show each matched space pair before/after per-space alignment | off |
 | `--space-match-thresh` | IoU threshold to accept a GT/PRED space match | `0.5` |
 | `--epsilon` | IoU threshold to consider an element correspondence | `0.05` |
+| `--footprint-cell` | Grid cell size (m) for rasterizing space footprints in the 2D IoU | `0.05` |
 | `--save-json` | Path to save JSON report | - |
 | `--save-csv-prefix` | Prefix for CSV output files (written inside the session directory) | `metrics` |
 | `--ifc-classes` | IFC classes to include (space- or comma-separated) | `IfcSpace IfcWall IfcWallStandardCase` |
@@ -85,10 +87,10 @@ Each run creates a timestamped session directory under `--mesh-output-dir`:
 
 ```
 out/<timestamp>__pred_<pred_name>__gt_<gt_name>/
-├── <prefix>_per_gt.csv        # Per-element metrics for GT elements (incl. room types)
-├── <prefix>_per_pred.csv      # Per-element metrics for PRED elements (incl. room types)
-├── <prefix>_edges.csv         # Pairwise IoU values between matched elements
-├── matched_space_floor_areas.csv  # Floor-area comparison for matched spaces
+├── <prefix>_per_gt.csv        # Per-element metrics for GT elements (incl. room types, 2D footprint IoU for spaces)
+├── <prefix>_per_pred.csv      # Per-element metrics for PRED elements (incl. room types, 2D footprint IoU for spaces)
+├── <prefix>_edges.csv         # Pairwise IoU values between matched elements (incl. 2D IoU for space pairs)
+├── matched_space_floor_areas.csv  # Floor-area comparison for matched spaces (incl. space_iou_2d)
 └── meshes/
     └── <match>/gt_space_with_elements.ply, pred_space_with_elements.ply
 ```

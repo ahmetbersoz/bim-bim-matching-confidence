@@ -267,6 +267,83 @@ def _mesh_floor_area_xy(mesh: o3d.geometry.TriangleMesh) -> float:
     return 0.5 * float(np.sum(area))
 
 
+def _footprint_mask_xy(
+    mesh: o3d.geometry.TriangleMesh,
+    xmin: float,
+    ymin: float,
+    cell: float,
+    nx: int,
+    ny: int
+) -> np.ndarray:
+    """
+    Rasterize the XY-projected footprint of a mesh onto a boolean occupancy grid.
+    A cell is occupied when its center lies inside any projected triangle.
+    """
+    mask = np.zeros((ny, nx), dtype=bool)
+    if mesh is None or len(mesh.triangles) == 0 or len(mesh.vertices) == 0:
+        return mask
+    V = np.asarray(mesh.vertices)
+    F = np.asarray(mesh.triangles)
+    tris = V[F][:, :, :2]  # (T, 3, 2)
+    for tri in tris:
+        (ax, ay), (bx, by), (cx, cy) = tri
+        denom = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+        if abs(denom) < 1e-12:
+            continue  # degenerate in projection (e.g. a vertical face)
+        ix0 = max(int(math.floor((min(ax, bx, cx) - xmin) / cell)), 0)
+        ix1 = min(int(math.floor((max(ax, bx, cx) - xmin) / cell)) + 1, nx)
+        iy0 = max(int(math.floor((min(ay, by, cy) - ymin) / cell)), 0)
+        iy1 = min(int(math.floor((max(ay, by, cy) - ymin) / cell)) + 1, ny)
+        if ix0 >= ix1 or iy0 >= iy1:
+            continue
+        xs = xmin + (np.arange(ix0, ix1) + 0.5) * cell
+        ys = ymin + (np.arange(iy0, iy1) + 0.5) * cell
+        X, Y = np.meshgrid(xs, ys)
+        l1 = ((by - cy) * (X - cx) + (cx - bx) * (Y - cy)) / denom
+        l2 = ((cy - ay) * (X - cx) + (ax - cx) * (Y - cy)) / denom
+        l3 = 1.0 - l1 - l2
+        inside = (l1 >= -1e-9) & (l2 >= -1e-9) & (l3 >= -1e-9)
+        mask[iy0:iy1, ix0:ix1] |= inside
+    return mask
+
+
+def _footprint_iou_2d(
+    mesh_a: o3d.geometry.TriangleMesh,
+    mesh_b: o3d.geometry.TriangleMesh,
+    cell: float = 0.05,
+    max_grid: int = 2048
+) -> float:
+    """
+    2D IoU between the XY footprints of two meshes.
+    Both footprints are rasterized onto a shared occupancy grid covering their
+    combined XY bounds; IoU = |A & B| / |A | B| over occupied cells. Handles
+    non-convex footprints. `cell` is the grid pitch in model units (meters);
+    it is coarsened automatically if the combined extent exceeds `max_grid`
+    cells per axis.
+    """
+    for m in (mesh_a, mesh_b):
+        if m is None or len(m.triangles) == 0 or len(m.vertices) == 0:
+            return 0.0
+    Va = np.asarray(mesh_a.vertices)[:, :2]
+    Vb = np.asarray(mesh_b.vertices)[:, :2]
+    # Disjoint XY bounds -> zero intersection
+    if (Va.max(axis=0) < Vb.min(axis=0)).any() or (Vb.max(axis=0) < Va.min(axis=0)).any():
+        return 0.0
+    lo = np.minimum(Va.min(axis=0), Vb.min(axis=0))
+    hi = np.maximum(Va.max(axis=0), Vb.max(axis=0))
+    extent = hi - lo
+    cell = max(float(cell), float(extent.max()) / float(max_grid), 1e-6)
+    nx = max(int(math.ceil(extent[0] / cell)), 1)
+    ny = max(int(math.ceil(extent[1] / cell)), 1)
+    mask_a = _footprint_mask_xy(mesh_a, float(lo[0]), float(lo[1]), cell, nx, ny)
+    mask_b = _footprint_mask_xy(mesh_b, float(lo[0]), float(lo[1]), cell, nx, ny)
+    union = int(np.count_nonzero(mask_a | mask_b))
+    if union == 0:
+        return 0.0
+    inter = int(np.count_nonzero(mask_a & mask_b))
+    return float(inter) / float(union)
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         v = float(value)
@@ -1581,7 +1658,8 @@ def _run_round(
     space_align_mode: str,
     apply_local_alignment: bool,
     target_guid_upper: str,
-    visualize_per_space: bool = False
+    visualize_per_space: bool = False,
+    footprint_cell: float = 0.05
 ) -> Tuple[Dict[str, Any], List[Tuple[Comp, Dict[str, Any]]]]:
     log_step(f"Starting '{round_label}' round ({'local' if apply_local_alignment else 'global-only'} evaluation)")
     by_space: Dict[str, Any] = {}
@@ -1657,6 +1735,7 @@ def _run_round(
         )
 
         post_iou = iou_between_two_obbs(gt_space.obb, spaces_pr[j_pr].obb, eps=inside_eps)
+        space_iou_2d = _footprint_iou_2d(gt_space.mesh, spaces_pr[j_pr].mesh, cell=footprint_cell)
         gt_floor_area = _mesh_floor_area_xy(gt_space.mesh)
         pred_floor_area = _mesh_floor_area_xy(spaces_pr[j_pr].mesh)
         gt_dim_x, gt_dim_y, gt_dim_z = _space_xyz_dimensions(gt_space)
@@ -1670,6 +1749,7 @@ def _run_round(
             "pred_name": spaces_pr[j_pr].meta.Name,
             "pred_room_type": _get_room_type(spaces_pr[j_pr]),
             "space_iou": float(post_iou),
+            "space_iou_2d": float(space_iou_2d),
             "gt_floor_area": gt_floor_area,
             "pred_floor_area": pred_floor_area,
             "floor_area_diff": pred_floor_area - gt_floor_area,
@@ -1689,6 +1769,7 @@ def _run_round(
             "T": _matrix_to_nested_list(T_space),
             "space_iou_before": float(pre_iou),
             "space_iou_after": float(post_iou),
+            "space_iou_2d_after": float(space_iou_2d),
             "is_target": is_target_space
         }
         if transform_candidates:
@@ -1723,6 +1804,7 @@ def _run_round(
             "pred_guid": pr_guid,
             "space_iou_before": float(pre_iou),
             "space_iou": float(post_iou),
+            "space_iou_2d": float(space_iou_2d),
             "is_target": is_target_space
         })
 
@@ -1905,6 +1987,8 @@ def _compute_round_element_metrics(
         pred_to_gt_space_idx: Dict[int, int] = {}
         space_iou_by_gt_idx: Dict[int, float] = {}
         space_iou_by_pred_idx: Dict[int, float] = {}
+        space_iou2d_by_gt_idx: Dict[int, float] = {}
+        space_iou2d_by_pred_idx: Dict[int, float] = {}
         for rec in space_match_records:
             gt_idx = rec.get("gt_index")
             pred_idx = rec.get("pred_index")
@@ -1919,6 +2003,9 @@ def _compute_round_element_metrics(
             iou_val = _safe_float(rec.get("space_iou", 0.0), default=0.0)
             space_iou_by_gt_idx[gt_i] = iou_val
             space_iou_by_pred_idx[pr_j] = iou_val
+            iou2d_val = _safe_float(rec.get("space_iou_2d", 0.0), default=0.0)
+            space_iou2d_by_gt_idx[gt_i] = iou2d_val
+            space_iou2d_by_pred_idx[pr_j] = iou2d_val
 
         gt_dims_by_guid: Dict[str, Tuple[float, float, float]] = {}
         pred_dims_by_guid: Dict[str, Tuple[float, float, float]] = {}
@@ -1956,14 +2043,16 @@ def _compute_round_element_metrics(
                 pred_guid_str = str(pred_space.guid or f"<pred-space-{pred_space_idx}>")
                 pred_index = pred_offset + pred_space_idx
                 space_iou = float(space_iou_by_gt_idx.get(gt_space_idx, 0.0))
+                space_iou_2d = float(space_iou2d_by_gt_idx.get(gt_space_idx, 0.0))
                 matches_pred_indices = [pred_index]
                 matches_pred_guids = [pred_guid_str]
-                pairwise_pred = [{"pred_index": pred_index, "pred_guid": pred_guid_str, "iou": space_iou}]
+                pairwise_pred = [{"pred_index": pred_index, "pred_guid": pred_guid_str, "iou": space_iou, "iou2d": space_iou_2d}]
                 local_compact = 1.0
             else:
                 pred_guid_str = None
                 pred_index = None
                 space_iou = 0.0
+                space_iou_2d = 0.0
                 matches_pred_indices = []
                 matches_pred_guids = []
                 pairwise_pred = []
@@ -1993,6 +2082,7 @@ def _compute_round_element_metrics(
                 "matches_pred_guids": matches_pred_guids,
                 "pairwise_pred": pairwise_pred,
                 "iou_union_pred_vs_gt": float(space_iou),
+                "iou2d_footprint": float(space_iou_2d),
                 "local_compactness_gt_to_pred": float(local_compact),
                 "gt_global_index": gt_space.idx
             })
@@ -2009,14 +2099,16 @@ def _compute_round_element_metrics(
                 gt_guid_str = str(gt_space.guid or f"<gt-space-{gt_space_idx}>")
                 gt_index = gt_offset + gt_space_idx
                 space_iou = float(space_iou_by_pred_idx.get(pred_space_idx, 0.0))
+                space_iou_2d = float(space_iou2d_by_pred_idx.get(pred_space_idx, 0.0))
                 matches_gt_indices = [gt_index]
                 matches_gt_guids = [gt_guid_str]
-                pairwise_gt = [{"gt_index": gt_index, "gt_guid": gt_guid_str, "iou": space_iou}]
+                pairwise_gt = [{"gt_index": gt_index, "gt_guid": gt_guid_str, "iou": space_iou, "iou2d": space_iou_2d}]
                 local_compact = 1.0
             else:
                 gt_guid_str = None
                 gt_index = None
                 space_iou = 0.0
+                space_iou_2d = 0.0
                 matches_gt_indices = []
                 matches_gt_guids = []
                 pairwise_gt = []
@@ -2045,6 +2137,7 @@ def _compute_round_element_metrics(
                 "matches_gt_guids": matches_gt_guids,
                 "pairwise_gt": pairwise_gt,
                 "iou_union_gt_vs_pred": float(space_iou),
+                "iou2d_footprint": float(space_iou_2d),
                 "local_compactness_pred_to_gt": float(local_compact),
                 "pred_global_index": pred_space.idx
             })
@@ -2061,6 +2154,7 @@ def _compute_round_element_metrics(
                 "pred_index": pred_offset + pred_space_idx,
                 "pred_guid": str(pred_space.guid or f"<pred-space-{pred_space_idx}>"),
                 "iou": float(space_iou_by_gt_idx.get(gt_space_idx, 0.0)),
+                "iou2d": float(space_iou2d_by_gt_idx.get(gt_space_idx, 0.0)),
                 "gt_global_index": gt_space.idx,
                 "pred_global_index": pred_space.idx
             })
@@ -2457,7 +2551,7 @@ def _write_csv_bundle(prefix: str, per_gt: List[Dict[str, Any]], per_pred: List[
     with open(f"{prefix}_per_gt.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow([
-            "gt_index","gt_guid","gt_ifc_type","gt_room_type","iou_union_pred_vs_gt",
+            "gt_index","gt_guid","gt_ifc_type","gt_room_type","iou_union_pred_vs_gt","iou2d_footprint",
             "local_compactness_gt_to_pred","gt_wall_thickness","avg_matched_pred_wall_thickness","num_matches","match_pred_guids",
             "gt_dim_x","gt_dim_y","gt_dim_z","gt_area"
         ])
@@ -2474,6 +2568,7 @@ def _write_csv_bundle(prefix: str, per_gt: List[Dict[str, Any]], per_pred: List[
                 r.get("gt_ifc_type"),
                 r.get("gt_room_type", ""),
                 f'{float(r.get("iou_union_pred_vs_gt", 0.0)):.6f}',
+                "" if r.get("iou2d_footprint") is None else f'{float(r.get("iou2d_footprint")):.6f}',
                 f'{float(r.get("local_compactness_gt_to_pred", 0.0)):.6f}',
                 "" if thickness in (None, "") else f'{float(thickness):.6f}',
                 "" if matched_avg in (None, "") else f'{float(matched_avg):.6f}',
@@ -2488,7 +2583,7 @@ def _write_csv_bundle(prefix: str, per_gt: List[Dict[str, Any]], per_pred: List[
     with open(f"{prefix}_per_pred.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow([
-            "pred_index","pred_guid","pred_ifc_type","pred_room_type","iou_union_gt_vs_pred",
+            "pred_index","pred_guid","pred_ifc_type","pred_room_type","iou_union_gt_vs_pred","iou2d_footprint",
             "local_compactness_pred_to_gt","pred_wall_thickness","num_matches","match_gt_guids",
             "pred_dim_x","pred_dim_y","pred_dim_z","pred_area"
         ])
@@ -2504,6 +2599,7 @@ def _write_csv_bundle(prefix: str, per_gt: List[Dict[str, Any]], per_pred: List[
                 r.get("pred_ifc_type"),
                 r.get("pred_room_type", ""),
                 f'{float(r.get("iou_union_gt_vs_pred", 0.0)):.6f}',
+                "" if r.get("iou2d_footprint") is None else f'{float(r.get("iou2d_footprint")):.6f}',
                 f'{float(r.get("local_compactness_pred_to_gt", 0.0)):.6f}',
                 "" if thickness in (None, "") else f'{float(thickness):.6f}',
                 len(r.get("matches_gt_indices", [])),
@@ -2516,14 +2612,15 @@ def _write_csv_bundle(prefix: str, per_gt: List[Dict[str, Any]], per_pred: List[
 
     with open(f"{prefix}_edges.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["gt_index","gt_guid","pred_index","pred_guid","pairwise_iou"])
+        w.writerow(["gt_index","gt_guid","pred_index","pred_guid","pairwise_iou","pairwise_iou2d"])
         for e in correspondences:
             w.writerow([
                 e.get("gt_index"),
                 e.get("gt_guid"),
                 e.get("pred_index"),
                 e.get("pred_guid"),
-                f'{float(e.get("iou", 0.0)):.6f}'
+                f'{float(e.get("iou", 0.0)):.6f}',
+                "" if e.get("iou2d") is None else f'{float(e.get("iou2d")):.6f}'
             ])
 
 
@@ -2582,7 +2679,7 @@ def write_floor_area_csv(path: str, round_label: str, records: List[Dict[str, An
             "round",
             "gt_guid", "gt_name", "gt_room_type",
             "pred_guid", "pred_name", "pred_room_type",
-            "space_iou",
+            "space_iou", "space_iou_2d",
             "gt_floor_area", "pred_floor_area",
             "floor_area_diff", "floor_area_abs_diff",
             "gt_dim_x", "gt_dim_y", "gt_dim_z",
@@ -2599,6 +2696,7 @@ def write_floor_area_csv(path: str, round_label: str, records: List[Dict[str, An
                 rec.get("pred_name"),
                 rec.get("pred_room_type", ""),
                 f'{float(rec.get("space_iou", 0.0)):.6f}',
+                f'{float(rec.get("space_iou_2d", 0.0)):.6f}',
                 f'{float(rec.get("gt_floor_area", 0.0)):.6f}',
                 f'{float(rec.get("pred_floor_area", 0.0)):.6f}',
                 f'{float(rec.get("floor_area_diff", 0.0)):.6f}',
@@ -2822,6 +2920,8 @@ def main():
     ap.add_argument("--space-match-thresh", type=float, default=0.5,
                     help="IoU threshold to accept a GT/PRED space match.")
     ap.add_argument("--epsilon", type=float, default=0.05, help="IoU threshold to consider a correspondence.")
+    ap.add_argument("--footprint-cell", type=float, default=0.05,
+                    help="Grid cell size (m) for rasterizing space footprints when computing 2D IoU.")
     ap.add_argument("--save-json", type=str, default=None, help="Path to save a JSON report.")
     ap.add_argument("--save-csv-prefix", type=str, default=None, help="Prefix to save CSVs: <prefix>_per_gt.csv, _per_pred.csv, _edges.csv")
     ap.add_argument("--ifc-classes", nargs="+", default=["IfcSpace", "IfcWall", "IfcWallStandardCase"],
@@ -2831,120 +2931,8 @@ def main():
     ap.add_argument("--inside-eps", type=float, default=1e-7, help="Tolerance for half-space tests / plane membership.")
     ap.add_argument("--ie-cap", type=int, default=8, help="Max K for exact inclusion-exclusion before pairwise approximation.")
 
-    # PAPER MODELS
 
-    # # Default CLI arguments for convenience (used only when no CLI args are provided)
-    # DEFAULT_ARGS = [
-    #     "--gt", "./input/JM_2nd_floor_w_spaces_updated.ifc",
-    #     "--pred", "./input/john-muir-2nd-v2-ifc4-geo-clean-autorotated.ifc",
-    #     "--target-space-guid", "1663O7_YHCi8qg8Qi5si4T", #gt-space
-    #     "--mesh-output-dir", "out",
-    #     "--floor-area-csv", "out/matched_space_floor_areas.csv",
-    #     "--align", "centroid",
-    #     "--space-align", "none",
-    #     "--space-match-thresh", "0.25",
-    #     "--epsilon", "0.10",
-    #     "--save-json", "metrics_obb.json",
-    #     "--save-csv-prefix", "out/metrics_obb",
-    #     "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace", "IfcDoor", "IfcWindow",
-    #     "--include-unmatched", "ignore",
-    # ]
-
-    # # Default CLI arguments for convenience (used only when no CLI args are provided)
-    # DEFAULT_ARGS = [
-    #     "--gt", "./input/JM_1st_floor_w_spaces.ifc",
-    #     "--pred", "./input/john-muir-1st-v2-ifc4-geo-autorotated.ifc",
-    #     "--target-space-guid", "1663O7_YHCi8qg8Qi5si4v", #gt-space
-    #     "--mesh-output-dir", "out",
-    #     "--floor-area-csv", "out/matched_space_floor_areas.csv",
-    #     "--align", "centroid",
-    #     "--space-align", "none",
-    #     "--space-match-thresh", "0.25",
-    #     "--epsilon", "0.10",
-    #     "--save-json", "metrics_obb.json",
-    #     "--save-csv-prefix", "out/metrics_obb",
-    #     "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace", "IfcDoor", "IfcWindow",
-    #     "--include-unmatched", "ignore",
-    # ]
-
-
-    # Default CLI arguments for convenience (used only when no CLI args are provided)
-    DEFAULT_ARGS = [
-        "--gt", ".\\input\\WW_revit_model_v6_w_spaces.ifc",
-        "--pred", ".\\input\\ww-v1-ifc4-geo.ifc",
-        "--target-space-guid", "1UABPD7uD69BRTD38UZ2$k",
-        "--mesh-output-dir", "out",
-        "--floor-area-csv", "out/matched_space_floor_areas.csv",
-        "--align", "centroid",
-        "--space-align", "none",
-        "--space-match-thresh", "0.25",
-        "--epsilon", "0.10",
-        "--save-json", "metrics_obb.json",
-        "--save-csv-prefix", "out/metrics_obb",
-        "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace", "IfcDoor", "IfcWindow",
-        "--include-unmatched", "ignore",
-    ]
-
-    
-
-    # # Default CLI arguments for convenience (used only when no CLI args are provided)
-    # DEFAULT_ARGS = [
-    #     "--gt", "./input/JM_1st_floor_w_spaces.ifc",
-    #     "--pred", "./input/john-muir-1st-v2-ifc4-geo-rotated.ifc",
-    #     # "--target-space-guid", "1663O7_YHCi8qg8Qi5si4r", #gt-space
-    #     # "--target-space-guid", "0UhoA17yvDzgPS6x1bHitJ", #pred-space
-    #     "--mesh-output-dir", "out",
-    #     "--floor-area-csv", "out/matched_space_floor_areas.csv",
-    #     "--align", "centroid",
-    #     "--space-align", "none",
-    #     "--space-match-thresh", "0.25",
-    #     "--epsilon", "0.10",
-    #     "--save-json", "metrics_obb.json",
-    #     "--save-csv-prefix", "out/metrics_obb",
-    #     "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace", "IfcDoor", "IfcWindow",
-    #     "--include-unmatched", "ignore",
-    # ]
-
-    # # Default CLI arguments for convenience (used only when no CLI args are provided)
-    # DEFAULT_ARGS = [
-    #     "--gt", ".\\input\\JohnMuir_revit_rotated_spaces_1st.ifc",
-    #     "--pred", ".\\input\\john-muir-1st-v1-ifc4-geo-rotated.ifc",
-    #     "--target-space-guid", "1663O7_YHCi8qg8Qi5si4a",
-    #     # "--target-space-guid", "1663O7_YHCi8qg8Qi5si4R",
-    #     "--mesh-output-dir", "out",
-    #     "--floor-area-csv", "out/matched_space_floor_areas.csv",
-    #     "--align", "icp",
-    #     "--space-align", "none",
-    #     "--space-match-thresh", "0.25",
-    #     "--epsilon", "0.10",
-    #     "--save-json", "metrics_obb.json",
-    #     "--save-csv-prefix", "out/metrics_obb",
-    #     "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace", "IfcDoor", "IfcWindow",
-    #     "--include-unmatched", "ignore",
-    # ]
-
-    # # Default CLI arguments for convenience (used only when no CLI args are provided)
-    # DEFAULT_ARGS = [
-    #     "--gt", ".\\input\\WW_revit_model_v6_w_spaces.ifc",
-    #     "--pred", ".\\input\\ww-v1-ifc4-geo.ifc",
-    #     # "--target-space-guid", "1UABPD7uD69BRTD38UZ2$I",
-    #     "--mesh-output-dir", "out",
-    #     "--floor-area-csv", "out/matched_space_floor_areas.csv",
-    #     "--align", "centroid",
-    #     "--space-align", "none",
-    #     "--space-match-thresh", "0.25",
-    #     "--epsilon", "0.10",
-    #     "--save-json", "metrics_obb.json",
-    #     "--save-csv-prefix", "out/metrics_obb",
-    #     "--ifc-classes", "IfcWall", "IfcWallStandardCase", "IfcSpace", "IfcDoor", "IfcWindow",
-    #     "--include-unmatched", "ignore",
-    # ]
-
-    if len(sys.argv) == 1:
-        log_step(f"No CLI arguments detected - using DEFAULT_ARGS: {' '.join(DEFAULT_ARGS)}")
-        args = ap.parse_args(DEFAULT_ARGS)
-    else:
-        args = ap.parse_args()
+    args = ap.parse_args()
 
     if args.ifc_classes is not None and len(args.ifc_classes) == 1 and ',' in args.ifc_classes[0]:
         args.ifc_classes = [s.strip() for s in args.ifc_classes[0].split(',') if s.strip()]
@@ -3123,7 +3111,8 @@ def main():
         "none",
         False,
         target_guid_upper,
-        False
+        False,
+        footprint_cell=args.footprint_cell
     )
     per_space_payloads["global"] = global_per_space_payload
 
@@ -3174,7 +3163,8 @@ def main():
         args.space_align,
         local_apply_alignment,
         target_guid_upper,
-        args.visualize_per_space and local_apply_alignment
+        args.visualize_per_space and local_apply_alignment,
+        footprint_cell=args.footprint_cell
     )
     per_space_payloads["local"] = local_per_space_payload
 
