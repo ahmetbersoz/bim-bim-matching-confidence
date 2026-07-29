@@ -61,6 +61,7 @@ Running `python main.py` with no arguments uses the `DEFAULT_ARGS` block defined
 | `--save-json` | Path to save JSON report | - |
 | `--save-csv-prefix` | Prefix for CSV output files (written inside the session directory) | `metrics` |
 | `--ifc-classes` | IFC classes to include (space- or comma-separated) | `IfcSpace IfcWall IfcWallStandardCase` |
+| `--no-global-csv` | Skip writing global-round CSVs when per-space alignment is enabled (JSON still has both rounds) | off |
 | `--include-unmatched` | Elements in unmatched spaces: `ignore` or `global` (aggregate in one bucket) | `ignore` |
 | `--inside-eps` | Tolerance for half-space tests / plane membership | `1e-7` |
 | `--ie-cap` | Max K for exact inclusion-exclusion before pairwise approximation | `8` |
@@ -94,6 +95,8 @@ out/<timestamp>__pred_<pred_name>__gt_<gt_name>/
 └── meshes/
     └── <match>/gt_space_with_elements.ply, pred_space_with_elements.ply
 ```
+
+CSV files are written per evaluation round with a `_global` / `_local` suffix. The **global** round evaluates after global alignment only; the **local** round re-evaluates after per-space alignment, so comparing the two shows how much per-space alignment helped. When `--space-align none` the local round is skipped entirely and only `_global` outputs are produced; when per-space alignment is enabled you can pass `--no-global-csv` to keep only the `_local` CSVs.
 
 The JSON report (`--save-json`) contains the complete metrics in one file.
 

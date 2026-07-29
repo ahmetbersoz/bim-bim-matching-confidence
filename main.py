@@ -2926,6 +2926,9 @@ def main():
     ap.add_argument("--save-csv-prefix", type=str, default=None, help="Prefix to save CSVs: <prefix>_per_gt.csv, _per_pred.csv, _edges.csv")
     ap.add_argument("--ifc-classes", nargs="+", default=["IfcSpace", "IfcWall", "IfcWallStandardCase"],
                     help="IFC classes to include (default: IfcSpace IfcWall IfcWallStandardCase). Pass comma-separated or space-separated values.")
+    ap.add_argument("--no-global-csv", action="store_true",
+                    help="When per-space alignment is enabled (--space-align != none), skip writing global-round CSV files "
+                         "(the JSON report still contains both rounds). Ignored when the global round is the only round.")
     ap.add_argument("--include-unmatched", choices=["ignore", "global"], default="ignore",
                     help="Handling for elements in unmatched spaces. 'ignore' skips them; 'global' aggregates them in a single unmatched bucket.")
     ap.add_argument("--inside-eps", type=float, default=1e-7, help="Tolerance for half-space tests / plane membership.")
@@ -3148,79 +3151,100 @@ def main():
         rounds["global"]["unmatched_bucket"] = global_unmatched_bucket
 
     local_apply_alignment = args.space_align.lower() != "none"
-    local_round_eval, local_per_space_payload = _run_round(
-        "local",
-        spaces_gt,
-        elems_gt,
-        spaces_pr,
-        elems_pr,
-        matches,
-        space_guid_to_elem_indices_gt,
-        space_guid_to_elem_indices_pr,
-        eps,
-        inside_eps,
-        max_k_for_ie,
-        args.space_align,
-        local_apply_alignment,
-        target_guid_upper,
-        args.visualize_per_space and local_apply_alignment,
-        footprint_cell=args.footprint_cell
-    )
-    per_space_payloads["local"] = local_per_space_payload
+    if local_apply_alignment:
+        local_round_eval, local_per_space_payload = _run_round(
+            "local",
+            spaces_gt,
+            elems_gt,
+            spaces_pr,
+            elems_pr,
+            matches,
+            space_guid_to_elem_indices_gt,
+            space_guid_to_elem_indices_pr,
+            eps,
+            inside_eps,
+            max_k_for_ie,
+            args.space_align,
+            local_apply_alignment,
+            target_guid_upper,
+            args.visualize_per_space,
+            footprint_cell=args.footprint_cell
+        )
+        per_space_payloads["local"] = local_per_space_payload
 
-    local_metrics_round, local_unmatched_summary, local_unmatched_bucket = _compute_round_element_metrics(
-        local_round_eval,
-        spaces_gt,
-        spaces_pr,
-        elems_gt,
-        elems_pr,
-        space_guid_to_elem_indices_gt,
-        space_guid_to_elem_indices_pr,
-        elem_guid_to_space_gt,
-        elem_guid_to_space_pr,
-        args.include_unmatched,
-        eps,
-        inside_eps,
-        max_k_for_ie,
-        local_apply_alignment,
-        args.align
-    )
+        local_metrics_round, local_unmatched_summary, local_unmatched_bucket = _compute_round_element_metrics(
+            local_round_eval,
+            spaces_gt,
+            spaces_pr,
+            elems_gt,
+            elems_pr,
+            space_guid_to_elem_indices_gt,
+            space_guid_to_elem_indices_pr,
+            elem_guid_to_space_gt,
+            elem_guid_to_space_pr,
+            args.include_unmatched,
+            eps,
+            inside_eps,
+            max_k_for_ie,
+            local_apply_alignment,
+            args.align
+        )
 
-    rounds["local"] = {
-        "overall": local_metrics_round["overall"],
-        "per_gt": local_metrics_round["per_gt"],
-        "per_pred": local_metrics_round["per_pred"],
-        "correspondences": local_metrics_round["correspondences"],
-        "by_space": local_round_eval["by_space"],
-        "space_matches": local_round_eval["space_match_records"],
-        "unmatched_summary": local_unmatched_summary,
-        "floor_area_records": local_round_eval["floor_area_records"]
-    }
-    if local_unmatched_bucket is not None:
-        rounds["local"]["unmatched_bucket"] = local_unmatched_bucket
+        rounds["local"] = {
+            "overall": local_metrics_round["overall"],
+            "per_gt": local_metrics_round["per_gt"],
+            "per_pred": local_metrics_round["per_pred"],
+            "correspondences": local_metrics_round["correspondences"],
+            "by_space": local_round_eval["by_space"],
+            "space_matches": local_round_eval["space_match_records"],
+            "unmatched_summary": local_unmatched_summary,
+            "floor_area_records": local_round_eval["floor_area_records"]
+        }
+        if local_unmatched_bucket is not None:
+            rounds["local"]["unmatched_bucket"] = local_unmatched_bucket
+    else:
+        log_step("Skipping 'local' round: --space-align is 'none', its outputs would duplicate the global round")
 
     combined_space_matches: List[Dict[str, Any]] = []
-    for rec_local in rounds["local"]["space_matches"]:
-        space_iou_global = float(rec_local.get("space_iou_before", rec_local.get("space_iou", 0.0)))
-        space_iou_local = float(rec_local.get("space_iou", 0.0))
-        combined_space_matches.append({
-            "match_index": rec_local["match_index"],
-            "gt_index": rec_local["gt_index"],
-            "pred_index": rec_local["pred_index"],
-            "gt_guid": rec_local["gt_guid"],
-            "pred_guid": rec_local["pred_guid"],
-            "is_target": rec_local["is_target"],
-            "space_iou_global": space_iou_global,
-            "space_iou_local": space_iou_local,
-            "space_iou_delta": space_iou_local - space_iou_global
-        })
+    if "local" in rounds:
+        for rec_local in rounds["local"]["space_matches"]:
+            space_iou_global = float(rec_local.get("space_iou_before", rec_local.get("space_iou", 0.0)))
+            space_iou_local = float(rec_local.get("space_iou", 0.0))
+            combined_space_matches.append({
+                "match_index": rec_local["match_index"],
+                "gt_index": rec_local["gt_index"],
+                "pred_index": rec_local["pred_index"],
+                "gt_guid": rec_local["gt_guid"],
+                "pred_guid": rec_local["pred_guid"],
+                "is_target": rec_local["is_target"],
+                "space_iou_global": space_iou_global,
+                "space_iou_local": space_iou_local,
+                "space_iou_delta": space_iou_local - space_iou_global
+            })
+    else:
+        for rec_global in rounds["global"]["space_matches"]:
+            combined_space_matches.append({
+                "match_index": rec_global["match_index"],
+                "gt_index": rec_global["gt_index"],
+                "pred_index": rec_global["pred_index"],
+                "gt_guid": rec_global["gt_guid"],
+                "pred_guid": rec_global["pred_guid"],
+                "is_target": rec_global["is_target"],
+                "space_iou_global": float(rec_global.get("space_iou", 0.0))
+            })
 
     gt_mesh_path = os.path.join(mesh_output_dir_abs, "gt_mesh.ply")
     pred_mesh_path = os.path.join(mesh_output_dir_abs, "pred_aligned_mesh.ply")
     pred_mesh_global_round_path = os.path.join(mesh_output_dir_abs, "pred_global_round_mesh.ply")
 
+    skip_global_csv = bool(args.no_global_csv) and "local" in rounds
+    if args.no_global_csv and "local" not in rounds:
+        log_step("--no-global-csv ignored: the global round is the only round")
+
     floor_area_csv_paths: Dict[str, str] = {}
     for round_label, round_data in rounds.items():
+        if skip_global_csv and round_label == "global":
+            continue
         round_path = _path_with_round_suffix(floor_area_csv_base, round_label)
         write_floor_area_csv(round_path, round_label, round_data.get("floor_area_records", []))
         round_data["floor_area_csv_path"] = round_path
@@ -3325,11 +3349,12 @@ def main():
             elems_pr_global_aligned,
             spaces_pr_global_aligned
         )
-        report_mesh_exports["metrics"]["rounds"]["local"] = _export_metric_meshes_for_round(
-            "local",
-            elems_pr,
-            spaces_pr
-        )
+        if "local" in rounds:
+            report_mesh_exports["metrics"]["rounds"]["local"] = _export_metric_meshes_for_round(
+                "local",
+                elems_pr,
+                spaces_pr
+            )
     except Exception as exc:
         log_step(f"Metric mesh export failed: {exc}")
 
@@ -3391,16 +3416,25 @@ def main():
         log_step(f"Exported {len(local_space_mesh_exports)} local round space mesh bundles to {local_space_mesh_dir}")
 
     log_step("Rendering console summary")
-    print("\n=== Space Matching (global -> local) ===")
+    if "local" in rounds:
+        print("\n=== Space Matching (global -> local) ===")
+    else:
+        print("\n=== Space Matching (global only) ===")
     print(f"GT spaces: {len(spaces_gt)} | PRED spaces: {len(spaces_pr)} | Matched: {len(matches)} | Threshold: {space_match_thresh:.2f}")
     if combined_space_matches:
         print("Top space matches (first 5):")
         for rec in combined_space_matches[:5]:
             flag = " (target)" if rec.get("is_target") else ""
-            print(
-                f"  GT {rec['gt_guid']} -> PRED {rec['pred_guid']} | "
-                f"IoU_global={rec['space_iou_global']:.3f} -> IoU_local={rec['space_iou_local']:.3f}{flag}"
-            )
+            if "space_iou_local" in rec:
+                print(
+                    f"  GT {rec['gt_guid']} -> PRED {rec['pred_guid']} | "
+                    f"IoU_global={rec['space_iou_global']:.3f} -> IoU_local={rec['space_iou_local']:.3f}{flag}"
+                )
+            else:
+                print(
+                    f"  GT {rec['gt_guid']} -> PRED {rec['pred_guid']} | "
+                    f"IoU_global={rec['space_iou_global']:.3f}{flag}"
+                )
     else:
         print("  No matched spaces.")
 
@@ -3432,6 +3466,9 @@ def main():
 
     if save_csv_prefix:
         for round_label, round_data in rounds.items():
+            if skip_global_csv and round_label == "global":
+                log_step("Skipping global-round CSV bundle (--no-global-csv)")
+                continue
             round_prefix = f"{save_csv_prefix}_{round_label}"
             save_csvs(round_prefix, round_data)
             log_step(f"Saved CSV bundle for round '{round_label}' with prefix: {round_prefix}")
